@@ -1,0 +1,246 @@
+---
+title: Importe
+jupyter: python3
+---
+
+
+
+```{python}
+import numpy as np
+import pandas as pd
+```
+
+# Load Data
+
+```{python}
+account = pd.read_csv("../data/raw/account.csv", sep=";")
+card = pd.read_csv("../data/raw/card.csv", sep=";")
+client = pd.read_csv("../data/raw/client.csv", sep=";")
+disp = pd.read_csv("../data/raw/disp.csv", sep=";")
+district = pd.read_csv("../data/raw/district.csv", sep=";")
+loan = pd.read_csv("../data/raw/loan.csv", sep=";")
+order = pd.read_csv("../data/raw/order.csv", sep=";")
+trans = pd.read_csv("../data/raw/trans.csv", sep=";", low_memory=False)
+```
+
+# EDA
+## PK Check
+
+### Account
+
+```{python}
+print("Unique:", account["account_id"].is_unique)
+print("Count:", account.shape[0])
+print("Duplicates:", account["account_id"].duplicated().sum())
+print("Missing values:", account["account_id"].isna().sum())
+
+print("\nData type of account_id:", account["account_id"].dtype)
+print("All same type:", account["account_id"].apply(type).nunique() == 1)
+```
+
+### Card / Credit Card
+
+```{python}
+print("Unique:", card["disp_id"].is_unique)
+print("Count:", card.shape[0])
+print("Duplicates:", card["disp_id"].duplicated().sum())
+print("Missing values:", card["disp_id"].isna().sum())
+
+print("\nData type of disp_id:", card["disp_id"].dtype)
+print("All same type:", card["disp_id"].apply(type).nunique() == 1)
+```
+
+### Client
+
+```{python}
+print("Unique:", client["client_id"].is_unique)
+print("Count:", client.shape[0])
+print("Duplicates:", client["client_id"].duplicated().sum())
+print("Missing values:", client["client_id"].isna().sum())
+
+print("\nData type of client_id:", client["client_id"].dtype)
+print("All same type:", client["client_id"].apply(type).nunique() == 1)
+```
+
+### Disp / Dispostion
+
+```{python}
+print("Unique:", disp["disp_id"].is_unique)
+print("Count:", disp.shape[0])
+print("Duplicates:", disp["disp_id"].duplicated().sum())
+print("Missing values:", disp["disp_id"].isna().sum())
+
+print("\nData type of disp_id:", disp["disp_id"].dtype)
+print("All same type:", disp["disp_id"].apply(type).nunique() == 1)
+```
+
+### District / Demograph
+
+```{python}
+print("Unique:", district["A1"].is_unique)
+print("Count:", district.shape[0])
+print("Duplicates:", district["A1"].duplicated().sum())
+print("Missing values:", district["A1"].isna().sum())
+
+print("\nData type of A1:", district["A1"].dtype)
+print("All same type:", district["A1"].apply(type).nunique() == 1)
+```
+
+### Loan
+
+```{python}
+print("Unique:", loan["loan_id"].is_unique)
+print("Count:", loan.shape[0])
+print("Duplicates:", loan["loan_id"].duplicated().sum())
+print("Missing values:", loan["loan_id"].isna().sum())
+
+print("\nData type of loan_id:", loan["loan_id"].dtype)
+print("All same type:", loan["loan_id"].apply(type).nunique() == 1)
+```
+
+### Order / Permanent Order
+
+```{python}
+print("Unique:", order["order_id"].is_unique)
+print("Count:", order.shape[0])
+print("Duplicates:", order["order_id"].duplicated().sum())
+print("Missing values:", order["order_id"].isna().sum())
+
+print("\nData type of order_id:", order["order_id"].dtype)
+print("All same type:", order["order_id"].apply(type).nunique() == 1)
+```
+
+### Trans / Transactions
+
+```{python}
+print("Unique:", trans["trans_id"].is_unique)
+print("Count:", trans.shape[0])
+print("Duplicates:", trans["trans_id"].duplicated().sum())
+print("Missing values:", trans["trans_id"].isna().sum())
+
+print("\nData type of trans_id:", trans["trans_id"].dtype)
+print("All same type:", trans["trans_id"].apply(type).nunique() == 1)
+```
+
+### Entschlüsse
+- Alle Counts stimmen mit dem pdf überein
+- Alle PK sind Unique
+- Alle PK sind vorhanden
+- Alle PK haben denselben Typ
+
+> Bei district / Demographic ist die PK Spalte nicht ```district_id``` sonder ```A1```. Diese Spalte wird von ```A1``` nach ```district_id``` umbenannt. 
+
+```{python}
+district.rename(columns={"A1": "district_id"}, inplace=True)
+district.head()
+```
+
+## Kardinalitäten Check
+
+```{python}
+# Define all FK relationships: (fk_table, fk_col, pk_table, pk_col)
+relations = [
+    (
+        account,
+        "district_id",
+        district,
+        "district_id",
+        "account.district_id -> district.district_id",
+    ),
+    (
+        client,
+        "district_id",
+        district,
+        "district_id",
+        "client.district_id -> district.district_id",
+    ),
+    (disp, "client_id", client, "client_id", "disp.client_id -> client.client_id"),
+    (
+        disp,
+        "account_id",
+        account,
+        "account_id",
+        "disp.account_id -> account.account_id",
+    ),
+    (card, "disp_id", disp, "disp_id", "card.disp_id -> disp.disp_id"),
+    (
+        loan,
+        "account_id",
+        account,
+        "account_id",
+        "loan.account_id -> account.account_id",
+    ),
+    (
+        order,
+        "account_id",
+        account,
+        "account_id",
+        "order.account_id -> account.account_id",
+    ),
+    (
+        trans,
+        "account_id",
+        account,
+        "account_id",
+        "trans.account_id -> account.account_id",
+    ),
+]
+
+rows = []
+for fk_df, fk_col, pk_df, pk_col, label in relations:
+    fk_values = fk_df[fk_col].dropna()
+    pk_values = pk_df[pk_col]
+
+    # Referential integrity: all FK values exist in PK?
+    orphans = ~fk_values.isin(pk_values)
+
+    # Cardinality: how many FK rows per PK value?
+    counts = fk_values.value_counts()
+
+    rows.append(
+        {
+            "Relation": label,
+            "FK rows": len(fk_values),
+            "FK nulls": fk_df[fk_col].isna().sum(),
+            "Orphans": orphans.sum(),
+            "PK used": fk_values.nunique(),
+            "PK total": len(pk_values),
+            "Min": counts.min(),
+            "Max": counts.max(),
+            "Median": counts.median(),
+            "Cardinality": "1:1" if counts.max() == 1 else f"1:N (max {counts.max()})",
+        }
+    )
+
+card_df = pd.DataFrame(rows)
+card_df.style.set_properties(**{"text-align": "left"})
+```
+
+### Erkenntnisse
+
+- Keine Orphans und keine FK-Nulls -> referentielle Integrität ist vollständig gegeben
+- **disp** ist die zentrale Brücken-Tabelle zwischen Client und Account
+
+| Relation | Kardinalität |
+|---|---|
+| district -> account | 1:N (32–554) |
+| district -> client | 1:N (43–663) |
+| client -> disp | 1:1 |
+| account -> disp | 1:N (max 2) |
+| disp -> card | 1:1 (optional, 892/5369) |
+| account -> loan | 1:1 (optional, 682/4500) |
+| account -> order | 1:N (max 5) |
+| account -> trans | 1:N (max 675) |
+
+
+> Da `card.disp_id` als PK der Card-Tabelle verwendet wird und gleichzeitig FK auf disp ist, ist die Beziehung disp -> card tatsächlich **1:0..1** (optional 1:1).
+
+## ERD
+**Info:** Aktuell fehlen noch die Werte ob ein Attribut unique ist und ob es optional ist oder nicht
+![title](../erd/aml.png)
+
+
+```{python}
+trans.info()
+```
+
