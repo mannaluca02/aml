@@ -2,3 +2,6 @@ ipykernel==7.2.0
 pandas>=3.0.0
 numpy>=2.4.0
 Jinja2>=3.0.0
+seaborn>=0.13.0
+matplotlib>=3.10.0
+scikit-learn>=1.6.0

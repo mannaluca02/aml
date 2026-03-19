@@ -1,3 +1,7 @@
 example/
 .venv/
 *.ipynb
+.DS_Store
+CLAUDE.md
+.idea/
+REFERENCES.md
