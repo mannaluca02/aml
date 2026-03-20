@@ -9,3 +9,4 @@ tsfresh>=0.21.0
 pyarrow>=23.0.0
 sklearn-compat>=0.1.5
 imbalanced-learn>=0.14.0
+wandb>=0.16.0

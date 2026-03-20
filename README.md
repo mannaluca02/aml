@@ -23,6 +23,7 @@ aml/
 |---|---|---|
 | `00_eda.ipynb` | 1 — Data Understanding & Study Design | PK/FK validation, cardinality checks, ERD, data quality analysis, exploration of all tables, study design with tenure-matched pseudo-event assignment, stratified train/test split. Outputs `study_table.parquet`. |
 | `01_feature_engineering.ipynb` | 2 — Feature Engineering | Transaction rollup filtering, tsfresh automatic feature extraction, baseline features (5 required), static/contextual features, feature matrix assembly, feature selection. Outputs `feature_matrix.parquet`. |
+| `02_modeling.ipynb` | 3 — Predictive Modeling & Validation | Baseline LogReg (5 features), extended LogReg (22 features), RandomForest, GradientBoosting, HistGradientBoosting with hyperparameter tuning. ROC/PR/Lift curves, Top-N% lists, feature importance, confusion matrices. W&B experiment tracking. |
 
 Run notebooks in order — each depends on outputs from the previous phase.
 
@@ -32,6 +33,7 @@ Run notebooks in order — each depends on outputs from the previous phase.
 |---|---|
 | `data.py` | Data loading and cleaning: `load_raw_data()` loads all 8 CSVs with date parsing, Czech string decoding, gender extraction. `load_study_table()`. Shared constants (`RANDOM_STATE`, `ROLLUP_MONTHS`, paths). |
 | `features.py` | Feature engineering: `filter_transactions_to_rollup()` for temporal filtering, `compute_tsfresh_features()` for automatic time series features, `compute_baseline_features()` for the 5 assignment-required features, `compute_static_features()` for district/loan/order/account features, `build_feature_matrix()` master builder. |
+| `modeling.py` | Modeling utilities: `build_pipeline()` for leakage-free sklearn pipelines, `evaluate_on_test()` for test-set metrics, `plot_roc_curves()`/`plot_pr_curves()`/`plot_lift_curve()` for evaluation charts, `compute_top_n_list()`/`compare_top_n_lists()` for customer prioritization, `plot_feature_importance()` for interpretability. |
 
 ### `data/`
 
