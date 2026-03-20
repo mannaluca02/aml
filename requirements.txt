@@ -5,3 +5,7 @@ Jinja2>=3.0.0
 seaborn>=0.13.0
 matplotlib>=3.10.0
 scikit-learn>=1.6.0
+tsfresh>=0.21.0
+pyarrow>=23.0.0
+sklearn-compat>=0.1.5
+imbalanced-learn>=0.14.0

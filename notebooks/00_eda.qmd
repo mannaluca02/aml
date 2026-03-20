@@ -1,5 +1,5 @@
 ---
-title: AML - Angewandtes Machine Learning
+title: 'AML - Phase 1: EDA'
 author: Luca Manna
 date: '2026-03-14'
 format:
@@ -15,20 +15,26 @@ jupyter: python3
 # Improvements:
 
 Folgende Punkte können in dem Notebook angepasst werden:
-- Anstatt 60/20/20 train/val/test solit kann ich auch 80/20 train/test split machen mit einen k-fold-crossvalidation -> Dies ersetzt dann sozusagen den val split da auf dem fold die parameter trainiert werden.
-  - Würde besonders sinn machen, da wir wenige daten haben. 
+haben. 
 - **Info:** Aktuell fehlen noch die Informationen ob ein Attribut unique ist und ob es optional ist oder nicht. 
-- 
+- Quellenverzeichniss bauen
 
 # Importe
 
 ```{python}
+import sys
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.patches import Patch
 from sklearn.model_selection import train_test_split
+
+# Projektroot für src-Importe
+sys.path.insert(0, "..")
+from src.data import parse_date, extract_gender_and_birth, set_plot_style
 ```
 
 ```{python}
@@ -57,24 +63,10 @@ TOTAL_HISTORY_MONTHS = ROLLUP_MONTHS + LAG_MONTHS  # 13
 JUNIOR_AGE_CUTOFF = 21  # max junior card holder age ≈ 20.89
 
 # Data Splits
-TRAIN_RATIO = 0.6
-VAL_RATIO = 0.2
+TRAIN_RATIO = 0.8
 TEST_RATIO = 0.2
 
-
-# Apply Plotting Theme
-def set_plot_style():
-    """Applies the project's standard plotting style."""
-    sns.set_theme(style="whitegrid", context="paper", palette="viridis")
-    plt.rcParams["figure.figsize"] = FIG_SIZE_DEFAULT
-    plt.rcParams["axes.titlesize"] = 14
-    plt.rcParams["axes.titleweight"] = "bold"
-    plt.rcParams["axes.labelsize"] = 12
-    plt.rcParams["xtick.labelsize"] = 10
-    plt.rcParams["ytick.labelsize"] = 10
-
-
-# Initialize style on startup
+# Initialize style on startup (imported from src.data)
 set_plot_style()
 ```
 
@@ -103,7 +95,7 @@ Ausgabe von:
 - Count
 - Duplicates
 - Missing
-- Data Tyoe
+- Data Type
 für alle Tabellen
 
 ```{python}
@@ -409,32 +401,7 @@ print("Tschechische Begriffe in `account`, `trans` und `order` erfolgreich decod
 In der `client` Tabelle ist das Geschlecht im Geburtsdatum (`birth_number`) einkodiert. Bei Frauen wird der Zahl für den Monat der Wert 50 hinzugefügt. Wir splitten dies in zwei separate Spalten `gender` (M/F) und `birth_date` auf und entfernen die alte kryptische Spalte.
 
 ```{python}
-# 'birth_number' format ist YYMMDD für Männer, YY(MM+50)DD für Frauen
-
-
-def extract_gender_and_birth(birth_number):
-    birth_str = str(birth_number).zfill(
-        6
-    )  # Sicherstellen dass es 6 Stellen sind (z.B. für Jg. 1900+)
-    year = int(birth_str[:2])
-    month = int(birth_str[2:4])
-    day = int(birth_str[4:])
-
-    # Prefix "19" setzen (da Daten aus den späten 90ern sind, sind die Kunden aus den 1900ern)
-    year += 1900
-
-    if month > 50:
-        gender = "F"
-        month -= 50
-    else:
-        gender = "M"
-
-    # Zusammenbauen als echten Datetime String
-    return pd.Series(
-        [gender, pd.to_datetime(f"{year}-{month:02d}-{day:02d}", errors="coerce")]
-    )
-
-
+# extract_gender_and_birth ist aus src.data importiert
 client[["gender", "birth_date"]] = client["birth_number"].apply(
     extract_gender_and_birth
 )
@@ -450,18 +417,7 @@ Aktuell liegen in mehreren Tabellen Datumsangaben im Format `YYMMDD` als Integer
 Gleichzeitig prüfen wir den minimalen und maximalen Zeitraum, um eine Vorstellung über das Gesamthistorien-Fenster zu erhalten.
 
 ```{python}
-# Format YYMMDD (int/str) nach datetime konvertieren für account, card, loan und trans
-def parse_date(col):
-    # Idempotenz-Check: Falls bereits datetime, nichts tun
-    if pd.api.types.is_datetime64_any_dtype(col):
-        return col
-
-    # Zu String machen, nur die ersten 6 Zeichen nehmen (wegen Zeitzusätzen in `card`)
-    # Annahme: Alle Jahreszahlen liegen im 20. Jahrhundert (19xx), da die Daten aus den 1990ern stammen.
-    col_str = col.astype(str).str[:6].str.zfill(6)
-    return pd.to_datetime("19" + col_str, format="%Y%m%d", errors="coerce")
-
-
+# parse_date ist aus src.data importiert
 account["date"] = parse_date(account["date"])
 card["issued"] = parse_date(card["issued"])
 loan["date"] = parse_date(loan["date"])
@@ -1186,7 +1142,7 @@ print(f"  Rollup-Fenster:    {ROLLUP_MONTHS} Monate")
 print(f"  Lag-Monat:         {LAG_MONTHS} Monat")
 print(f"  Gesamt-Historie:   {TOTAL_HISTORY_MONTHS} Monate")
 print(f"  Junior-Cutoff:     {JUNIOR_AGE_CUTOFF} Jahre")
-print(f"  Split-Ratios:      Train={TRAIN_RATIO}, Val={VAL_RATIO}, Test={TEST_RATIO}")
+print(f"  Split-Ratios:      Train={TRAIN_RATIO}, Test={TEST_RATIO}")
 ```
 
 # Studiendesign: Zeitliche Synchronisierung
@@ -1329,13 +1285,14 @@ print(f"\n  Finale Studiengruppe Target=1: {len(card_study_valid)} Konten")
 
 ## Strategie: Kontrollierte Tenure-Matched Zufallszuweisung
 
-Um Nicht-Kartenbesitzern ein faires Pseudo-Ereignisdatum zuzuweisen, verwenden wir die **empirische Verteilung der Kontoalter zum Kartenkaufzeitpunkt** — aber ausschliesslich aus dem **Trainingsset** — als Vorlage. Damit wird verhindert, dass Informationen aus dem Validierungs- oder Testset in die Pseudo-Event-Zuweisung einfliessen (Data Leakage).
+Um Nicht-Kartenbesitzern ein faires Pseudo-Ereignisdatum zuzuweisen, verwenden wir die **empirische Verteilung der Kontoalter zum Kartenkaufzeitpunkt** — aber ausschliesslich aus dem **Trainingsset** — als Vorlage. Damit wird verhindert, dass Informationen aus dem Testset in die Pseudo-Event-Zuweisung einfliessen (Data Leakage).
 
 **Ablauf:**
 
-1. **Stratifizierter 60/20/20-Split** aller eligible Accounts (nach Target) → Train / Val / Test
+1. **Stratifizierter 80/20-Split** aller eligible Accounts (nach Target) → Train / Test
 2. Empirische `months_to_event`-Verteilung wird **nur aus Train-Card-Holders** berechnet
 3. Pseudo-Events werden mit dieser Train-Verteilung für **alle** Non-Card-Accounts zugewiesen
+4. Hyperparameter-Tuning und Modellselektion erfolgen via **k-Fold Cross-Validation** auf dem Trainingsset
 
 **Algorithmus für jedes Nicht-Karten-Konto:**
 
@@ -1350,8 +1307,11 @@ Die Kartenausstellungen konzentrieren sich auf 1997–1998. Ein reines Kalenderz
 **Warum Lag-Monat?**
 Der 1-Monats-Buffer zwischen Rollup-Ende und Ereignisdatum (`[rollup_start ... rollup_end] [1M Lag] [event_date]`) verhindert, dass Transaktionen aus dem Antragsmonat in die Features einfliessen.
 
+**Warum kein Validierungsset?**
+Da Hyperparameter-Tuning und Modellselektion über **stratifizierte k-Fold Cross-Validation** auf dem Trainingsset erfolgen, ist ein separates Validierungsset überflüssig. Der 80/20-Split maximiert die verfügbare Trainingsmenge — wichtig bei einem kleinen Datensatz mit moderatem Klassenungleichgewicht.
+
 ```{python}
-# === Stratifizierter Train/Val/Test Split (VOR Pseudo-Event-Zuweisung) ===
+# === Stratifizierter Train/Test Split (VOR Pseudo-Event-Zuweisung) ===
 
 # Alle eligible Accounts mit Target-Label
 eligible_accounts = pd.DataFrame({"account_id": list(eligible_account_ids)})
@@ -1359,28 +1319,18 @@ eligible_accounts["target"] = (
     eligible_accounts["account_id"].isin(card_account_ids).astype(int)
 )
 
-# Split 1: Train+Val (80%) vs Test (20%), stratifiziert nach Target
-train_val_accs, test_accs = train_test_split(
+# Single split: Train (80%) vs Test (20%), stratifiziert nach Target
+train_accs, test_accs = train_test_split(
     eligible_accounts,
     test_size=TEST_RATIO,
     stratify=eligible_accounts["target"],
     random_state=RANDOM_STATE,
 )
 
-# Split 2: Train (75% von 80% = 60%) vs Val (25% von 80% = 20%), stratifiziert
-train_accs, val_accs = train_test_split(
-    train_val_accs,
-    test_size=VAL_RATIO / (TRAIN_RATIO + VAL_RATIO),  # 0.25
-    stratify=train_val_accs["target"],
-    random_state=RANDOM_STATE,
-)
-
-# Split-Map: account_id -> "train"/"val"/"test"
+# Split-Map: account_id -> "train"/"test"
 split_map: dict[int, str] = {}
 for acc_id in train_accs["account_id"]:
     split_map[acc_id] = "train"
-for acc_id in val_accs["account_id"]:
-    split_map[acc_id] = "val"
 for acc_id in test_accs["account_id"]:
     split_map[acc_id] = "test"
 
@@ -1390,10 +1340,9 @@ empirical_months = card_study_valid[
     card_study_valid["account_id"].isin(train_card_ids)
 ]["months_to_event"]
 
-print("=== Stratifizierter Split (60/20/20) ===")
+print("=== Stratifizierter Split (80/20) ===")
 for split_name, split_df in [
     ("Train", train_accs),
-    ("Val", val_accs),
     ("Test", test_accs),
 ]:
     n = len(split_df)
@@ -1540,7 +1489,7 @@ print(f"\n{ct.to_string()}")
 
 # Prozentuale Verteilung pro Split
 print("\nTarget=1 Anteil pro Split:")
-for split_name in ["train", "val", "test"]:
+for split_name in ["train", "test"]:
     sub = study_table[study_table["split"] == split_name]
     n1 = sub["target"].sum()
     print(f"  {split_name:5s}: {n1}/{len(sub)} = {n1/len(sub)*100:.1f}%")
@@ -1550,9 +1499,11 @@ for split_name in ["train", "val", "test"]:
 
 Von den ursprünglich 747 Kartenbesitzern (classic + gold) wurden zunächst DISPONENTen und Kunden unter 21 Jahren ausgeschlossen. Von den verbleibenden eligible Card-Holders wurden jene entfernt, deren Karte innerhalb der ersten 13 Monate nach Kontoeröffnung ausgestellt wurde — für diese existiert keine vollständige Rollup-Historie (12M + 1M Lag).
 
-**Stratifizierter Split:** Der 60/20/20-Split erfolgt **vor** der Pseudo-Event-Zuweisung. Damit wird sichergestellt, dass die empirische `months_to_event`-Verteilung ausschliesslich aus Train-Card-Holders stammt. Das Klassenverhältnis (Target=1 Anteil) ist über alle drei Splits konsistent — eine Bestätigung der korrekten Stratifizierung.
+**Stratifizierter Split:** Der 80/20-Split erfolgt **vor** der Pseudo-Event-Zuweisung. Damit wird sichergestellt, dass die empirische `months_to_event`-Verteilung ausschliesslich aus Train-Card-Holders stammt. Das Klassenverhältnis (Target=1 Anteil) ist über beide Splits konsistent — eine Bestätigung der korrekten Stratifizierung.
 
-**Pseudo-Event-Leakage verhindert:** Da die Verteilung nur aus Trainingsdaten kommt, können Val/Test-Splits als unabhängige Evaluationssets dienen.
+**Kein separates Validierungsset:** Hyperparameter-Tuning und Modellselektion erfolgen via stratifizierter k-Fold Cross-Validation auf dem Trainingsset. Das Testset wird nur einmal für die finale Evaluation verwendet.
+
+**Pseudo-Event-Leakage verhindert:** Da die Verteilung nur aus Trainingsdaten kommt, kann das Testset als unabhängiges Evaluationsset dienen.
 
 **Klassenungleichgewicht:** Der Anteil der Positivklasse liegt bei ca. 13–16%. Dies ist ein moderates Ungleichgewicht, das beim Modeling berücksichtigt werden muss (z.B. stratifizierte CV-Splits, Precision/Recall-Metriken, Class Weights).
 
@@ -1617,7 +1568,7 @@ axes[1, 0].set_ylabel("Monate nach Kontoeröffnung")
 # (1,1) Grouped Bar Chart: Target-Verteilung pro Split
 split_target_ct = pd.crosstab(study_table["split"], study_table["target"])
 split_target_ct.columns = ["Target=0", "Target=1"]
-split_order = ["train", "val", "test"]
+split_order = ["train", "test"]
 split_target_ct = split_target_ct.reindex(split_order)
 split_target_ct.plot(
     kind="bar",
@@ -1629,7 +1580,7 @@ split_target_ct.plot(
 axes[1, 1].set_title("Target-Verteilung pro Split\n(Stratifizierung bestätigt)")
 axes[1, 1].set_xlabel("Split")
 axes[1, 1].set_ylabel("Anzahl Accounts")
-axes[1, 1].set_xticklabels(["Train", "Val", "Test"], rotation=0)
+axes[1, 1].set_xticklabels(["Train", "Test"], rotation=0)
 axes[1, 1].legend(title="Target")
 
 plt.tight_layout()
@@ -1642,13 +1593,13 @@ print(study_table.groupby("target")["months_to_event"].describe().round(1).to_st
 
 ### Interpretation der Verteilungsvergleiche
 
-**Tenure-Matching (oben links):** Die Verteilung des Kontoalters zum Ereigniszeitpunkt (`months_to_event`) zeigt eine hohe Übereinstimmung zwischen Käufern und Nicht-Käufern. Dies bestätigt, dass die Pseudo-Ereignisdaten die Tenure-Struktur der echten Kartenbesitzer gut replizieren. Die empirische Verteilung stammt ausschliesslich aus **Train-Card-Holders** — Val/Test-Daten sind nicht eingeflossen.
+**Tenure-Matching (oben links):** Die Verteilung des Kontoalters zum Ereigniszeitpunkt (`months_to_event`) zeigt eine hohe Übereinstimmung zwischen Käufern und Nicht-Käufern. Dies bestätigt, dass die Pseudo-Ereignisdaten die Tenure-Struktur der echten Kartenbesitzer gut replizieren. Die empirische Verteilung stammt ausschliesslich aus **Train-Card-Holders** — Testdaten sind nicht eingeflossen.
 
 **Kalenderzeit (oben rechts):** Die Kalenderzeitverteilung der Nicht-Käufer-Ereignisse ist breiter gestreut als bei den Käufern, da Nicht-Käufer-Konten über den gesamten Zeitraum eröffnet wurden. Dies ist erwünscht — es bedeutet, dass die Nicht-Käufer nicht künstlich auf das gleiche Kalenderfenster komprimiert werden.
 
 **Boxplot (unten links):** Beide Gruppen verlieren Konten mit weniger als 13 Monaten Tenure (12M Rollup + 1M Lag), da der Constraint symmetrisch angewendet wird.
 
-**Stratifizierung (unten rechts):** Das Balkendiagramm bestätigt, dass die Target-Klassen gleichmässig über Train/Val/Test verteilt sind — der stratifizierte Split funktioniert korrekt.
+**Stratifizierung (unten rechts):** Das Balkendiagramm bestätigt, dass die Target-Klassen gleichmässig über Train und Test verteilt sind — der stratifizierte Split funktioniert korrekt.
 
 ```{python}
 # === Stichproben-Check: 5 zufällige Konten pro Gruppe ===
@@ -1779,11 +1730,12 @@ Für jedes Konto gilt: `[rollup_start ... rollup_end] [1 Monat Lag] [event_date]
 - **Rollup:** 12 Monate Feature-Aggregationszeitraum (min, max, mean, median, std, slope, MAD, etc.)
 - **Lag:** 1 Monat Buffer verhindert Antragsmonat-Leakage
 
-### Train/Val/Test Split
+### Train/Test Split
 
-- **60/20/20** stratifiziert nach Target, durchgeführt **vor** der Pseudo-Event-Zuweisung
-- Empirische Verteilung stammt ausschliesslich aus Train-Daten → kein Leakage in Val/Test
-- Klassenverhältnis konsistent über alle Splits (~13–16% Target=1)
+- **80/20** stratifiziert nach Target, durchgeführt **vor** der Pseudo-Event-Zuweisung
+- Empirische Verteilung stammt ausschliesslich aus Train-Daten → kein Leakage in Test
+- Klassenverhältnis konsistent über beide Splits (~13–16% Target=1)
+- **Kein separates Validierungsset:** Modellselektion und Hyperparameter-Tuning erfolgen via stratifizierter k-Fold Cross-Validation auf dem Trainingsset
 
 ### Klassenungleichgewicht
 Moderates Ungleichgewicht. Empfohlene Massnahmen beim Modeling:
@@ -1791,4 +1743,25 @@ Moderates Ungleichgewicht. Empfohlene Massnahmen beim Modeling:
 - Stratifizierte k-Fold Cross-Validation auf dem Trainingsset
 - Metriken: ROC-AUC, Precision, Recall, Lift
 - Optional: Class Weights oder Oversampling (SMOTE)
+
+```{python}
+# === Studientabelle persistieren (für Phase 2: Feature Engineering) ===
+
+os.makedirs("../data/processed", exist_ok=True)
+study_table.to_parquet("../data/processed/study_table.parquet", index=False)
+print(
+    f"study_table gespeichert: {study_table.shape[0]} Zeilen, {study_table.shape[1]} Spalten"
+)
+print(f"  Pfad: ../data/processed/study_table.parquet")
+```
+
+# Quellenverzeichnis
+
+1. Berka, P. (1999). *PKDD'99 Discovery Challenge: Czech Financial Dataset*. Czech Technical University, Prague.
+
+2. Her, Q., Getz, K., Engel, T. & Engel, A. (2024). Core Concepts in Pharmacoepidemiology: New-User Designs. *Clinical Therapeutics*, 46(12), e1–e6. https://pmc.ncbi.nlm.nih.gov/articles/PMC11588434/
+
+3. Pottegård, A., Hallas, J., Olesen, M. et al. (2022). Core concepts in pharmacoepidemiology: Fundamentals of the cohort and case-control study designs. *Pharmacoepidemiology and Drug Safety*, 31(8), 817–826. https://pmc.ncbi.nlm.nih.gov/articles/PMC9545534/
+
+4. Suissa, S. (2008). Immortal Time Bias in Pharmacoepidemiology. *American Journal of Epidemiology*, 167(4), 492–499. https://academic.oup.com/aje/article/167/4/492/233064
 

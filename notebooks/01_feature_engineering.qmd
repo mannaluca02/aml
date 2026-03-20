@@ -1,0 +1,532 @@
+---
+title: 'AML - Phase 2: Feature Engineering'
+author: Luca Manna
+date: '2026-03-14'
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    embed-resources: true
+lang: de
+jupyter: python3
+---
+
+INFO:
+- die tsfresh bibliothek nimmt derzeit das ganze signal. folgendes fehlt: Solche Window-Vergleichs-Features könnte man manuell bauen, z.B.
+  - balance_mean_q1 vs. balance_mean_q4 → balance_trend_q1_q4
+  - turnover_first_half vs. turnover_second_half                                                                                         
+  - Monatliche Aggregation → Slope über die 12 monatlichen Mittelwerte
+
+In dieser Phase wird der **Client Analytical Record** erstellt — eine Zeile pro Konto mit allen prädiktiven Features. Grundlage ist die `study_table` aus Phase 1, die für jedes Konto das Rollup-Zeitfenster `[rollup_start, rollup_end]`, das Target-Label und den Train/Test-Split definiert.
+
+**Feature-Kategorien:**
+1. **tsfresh (automatisch):** ~1'500 Features aus Transaktions-Zeitreihen (Betrag & Saldo) via `EfficientFCParameters` (~777 pro Zeitreihe)
+2. **Baseline (5 Features):** Alter, Geschlecht, Region, Vermögen, Umsatz — gemäss Aufgabenstellung
+3. **Statische Features:** Bezirk, Kredit, Daueraufträge, Kontofrequenz
+
+```{python}
+import sys
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+# Add project root to path so we can import src
+sys.path.insert(0, "..")
+
+from src.data import (
+    load_raw_data,
+    load_study_table,
+    set_plot_style,
+    RANDOM_STATE,
+    ROLLUP_MONTHS,
+    LAG_MONTHS,
+    TOTAL_HISTORY_MONTHS,
+    PATH_PROCESSED,
+)
+from src.features import (
+    filter_transactions_to_rollup,
+    compute_tsfresh_features,
+    compute_baseline_features,
+    compute_static_features,
+    build_feature_matrix,
+    get_feature_overview_table,
+    BASELINE_FEATURE_COLS,
+    TSFRESH_FEATURE_PREFIX,
+)
+
+set_plot_style()
+print("Imports OK")
+```
+
+```{python}
+# Load raw data and study table
+data = load_raw_data()
+account, card, client, disp, district = (
+    data["account"],
+    data["card"],
+    data["client"],
+    data["disp"],
+    data["district"],
+)
+loan, order, trans = data["loan"], data["order"], data["trans"]
+
+study_table = load_study_table()
+
+print(f"Study Table: {study_table.shape[0]} Accounts, {study_table.shape[1]} Spalten")
+print(f"Transaktionen: {len(trans):,}")
+print(f"\nTarget-Verteilung:")
+print(study_table["target"].value_counts().sort_index().to_string())
+```
+
+## Data Pipeline Übersicht
+
+Die Feature-Engineering-Pipeline transformiert die Rohdaten in einen flachen Feature-Vektor pro Konto:
+
+```
+Raw Tables (8 CSVs)
+    │
+    ├── trans (1M+ rows) ──► Rollup Filter [rollup_start, rollup_end] ──► trans_rollup (~280K rows)
+    │                              │
+    │                              ├── tsfresh EfficientFCParameters ──► ~1'500 auto Features (amount + balance)
+    │                              └── Baseline Aggregation ──► balance_last, turnover
+    │
+    ├── client + disp ──► age_at_event, gender
+    ├── district ──► avg_salary, unemployment, urban_ratio, inhabitants, entrepreneurs, crimes
+    ├── loan (temporal guard) ──► has_loan, loan_amount, loan_monthly_payment
+    ├── order ──► order_count, order_total_amount, has_insurance/household/loan_order
+    └── account ──► frequency one-hot, months_to_event
+                              │
+                              ▼
+                    Feature Matrix (1 row per account, ~1'580 features)
+```
+
+**Hinweis:** tsfresh `EfficientFCParameters` enthält 73 Feature-Funktionen, von denen viele parametrisiert sind (z.B. FFT-Koeffizienten für 100 Frequenzen, Quantile für verschiedene q-Werte). Dadurch entstehen ~777 konkrete Features pro Zeitreihe statt ~73. Mit `select_features()` werden nach der Extraktion nur die statistisch relevanten Features beibehalten.
+
+**Leakage Guards:**
+- Transaktionen strikt auf `[rollup_start, rollup_end]` gefiltert (kein Lag-Zeitraum, keine Post-Event-Daten)
+- Kredite nur einbezogen wenn `loan.date <= rollup_end`
+- Feature Scaling/Encoding erst im sklearn Pipeline beim Modeling
+
+```{python}
+# === Transaktionen auf Rollup-Fenster filtern ===
+trans_rollup = filter_transactions_to_rollup(trans, study_table)
+
+print(f"Transaktionen vorher:  {len(trans):>10,}")
+print(f"Transaktionen nachher: {len(trans_rollup):>10,}")
+print(f"Reduktion:             {(1 - len(trans_rollup)/len(trans))*100:.1f}%")
+
+# Stichproben-Check: Konten #14 und #18
+print("\n--- Stichproben-Check ---")
+for acc_id in [14, 18]:
+    if acc_id in study_table["account_id"].values:
+        row = study_table[study_table["account_id"] == acc_id].iloc[0]
+        n_tx = (trans_rollup["account_id"] == acc_id).sum()
+        print(
+            f"Konto #{acc_id}: {n_tx} Transaktionen in [{row['rollup_start'].date()} .. {row['rollup_end'].date()}]"
+        )
+    else:
+        print(f"Konto #{acc_id}: nicht in study_table (excluded)")
+```
+
+## tsfresh Feature Extraction
+
+Wir verwenden `tsfresh` mit `EfficientFCParameters` um automatisch Features aus den Transaktions-Zeitreihen zu extrahieren. Für jedes Konto werden die `amount`- und `balance`-Zeitreihen innerhalb des Rollup-Fensters analysiert.
+
+`EfficientFCParameters` umfasst 73 Feature-Funktionen (z.B. Autokorrelation, Entropy, FFT-Koeffizienten, lineare Trends, Quantile). Viele dieser Funktionen sind parametrisiert — z.B. berechnet die FFT-Funktion Koeffizienten für 100 Frequenzen, Quantile werden für mehrere q-Werte berechnet. Dadurch entstehen **~777 konkrete Features pro Zeitreihe**, also insgesamt **~1'554 Features** für die beiden Zeitreihen `amount` und `balance`.
+
+**Konfiguration:**
+- `column_id`: account_id (gruppiert Zeitreihen pro Konto)
+- `column_sort`: zeitlicher Index (monoton steigend pro Konto)
+- `default_fc_parameters`: EfficientFCParameters (schneller als ComprehensiveFCParameters, aber noch umfangreich)
+- NaN/Inf werden nach der Extraktion via `tsfresh.utilities.dataframe_functions.impute()` bereinigt
+
+Im Anschluss reduziert `select_features()` die Feature-Menge auf statistisch relevante Features (von ~1'554 auf ~617).
+
+```{python}
+# === tsfresh Feature Extraction ===
+t0 = time.time()
+tsfresh_features = compute_tsfresh_features(trans_rollup, study_table)
+elapsed = time.time() - t0
+
+print(f"tsfresh Features: {tsfresh_features.shape}")
+print(f"  Accounts: {tsfresh_features.shape[0]}")
+print(f"  Features: {tsfresh_features.shape[1]}")
+print(f"  Laufzeit: {elapsed:.1f} Sekunden ({elapsed/60:.1f} Minuten)")
+print(f"\nBeispiel-Features (erste 10 Spalten):")
+print(tsfresh_features.iloc[:3, :10].to_string())
+```
+
+```{python}
+# === tsfresh Feature-Analyse ===
+
+# NaN-Anteil nach Imputation (sollte 0 sein)
+nan_counts = tsfresh_features.isna().sum()
+nan_nonzero = nan_counts[nan_counts > 0]
+print(f"Features mit NaN nach Imputation: {len(nan_nonzero)}")
+
+# Varianz-Analyse: Features mit Null-Varianz identifizieren
+variances = tsfresh_features.var()
+zero_var = (variances == 0).sum()
+print(f"Features mit Null-Varianz (konstant): {zero_var}")
+print(f"Features mit Varianz > 0: {(variances > 0).sum()}")
+
+# Top-20 Features nach Varianz (normalisiert)
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Korrelationsheatmap der Top-20 Features (nach Varianz)
+top_var_cols = variances.nlargest(20).index.tolist()
+corr_matrix = tsfresh_features[top_var_cols].corr()
+sns.heatmap(
+    corr_matrix,
+    ax=axes[0],
+    cmap="viridis",
+    center=0,
+    vmin=-1,
+    vmax=1,
+    xticklabels=False,
+    yticklabels=False,
+)
+axes[0].set_title("Korrelation der Top-20 tsfresh Features\n(nach Varianz)")
+
+# Verteilung der Feature-Varianzen (log-Skala)
+sns.histplot(np.log10(variances[variances > 0] + 1e-10), bins=50, ax=axes[1])
+axes[1].set_title("Verteilung der Feature-Varianzen (log10)")
+axes[1].set_xlabel("log10(Varianz)")
+axes[1].set_ylabel("Anzahl Features")
+
+plt.tight_layout()
+plt.show()
+```
+
+### Interpretation: tsfresh Feature-Analyse
+
+**Korrelationsheatmap (links):** Die Top-20 Features (nach Varianz) zeigen deutliche Korrelationsblöcke. Mehrere Feature-Gruppen sind stark positiv korreliert (gelbe Blöcke, r > 0.75), was auf redundante Information hindeutet — z.B. sind `abs_energy`, `sum_values` und `mean` einer Zeitreihe mathematisch eng verwandt. Gleichzeitig gibt es negativ korrelierte Paare (dunkle Zellen), die komplementäre Informationen liefern. Diese hohe Multikollinearität unter den Top-Varianz-Features ist für baumbasierte Modelle unkritisch, könnte aber bei linearen Modellen zu Instabilität führen.
+
+**Varianzverteilung (rechts):** Die log10-Verteilung der Feature-Varianzen erstreckt sich über ~40 Grössenordnungen (von 10⁻¹⁰ bis 10³⁰). Der deutliche Peak bei ~10⁸ entspricht Features wie `abs_energy` und `sum_values`, deren Werte im Millionenbereich liegen. Der zweite Häufungspunkt bei ~10⁻⁵ zeigt normalisierte Features (Autokorrelationen, Entropien). **323 Features (21%) haben exakt Null-Varianz** und sind damit konstant über alle Konten — diese tragen keine prädiktive Information und werden durch `select_features()` eliminiert.
+
+## Baseline Features
+
+Die 5 Baseline-Features sind gemäss Aufgabenstellung vorgeschrieben und bilden die Grundlage für das Baseline-Modell (Logistische Regression):
+
+| Feature | Beschreibung | Quelle |
+|---|---|---|
+| `age_at_event` | Alter des Kontoinhabers zum Ereigniszeitpunkt | client.birth_date, study_table.event_date |
+| `gender` | Geschlecht (1=M, 0=F) | client.birth_number |
+| `district_avg_salary` | Durchschnittsgehalt im Bezirk (= Region-Proxy) | district.A11 |
+| `balance_last` | Letzter Kontostand im Rollup-Fenster (= Vermögen) | trans.balance |
+| `turnover` | Summe der absoluten Beträge im Rollup (= Umsatz) | trans.amount |
+
+```{python}
+# === Baseline Features berechnen ===
+baseline_features = compute_baseline_features(
+    trans_rollup, study_table, client, disp, account, district
+)
+
+print("Baseline Features:")
+print(baseline_features[BASELINE_FEATURE_COLS].describe().round(2).to_string())
+
+# Spot-Check: Konten #14 und #18
+print("\n--- Spot-Check: Konten #14 und #18 ---")
+for acc_id in [14, 18]:
+    if acc_id in baseline_features["account_id"].values:
+        row = baseline_features[baseline_features["account_id"] == acc_id].iloc[0]
+        print(f"\nKonto #{acc_id}:")
+        print(f"  Vermögen (balance_last): {row['balance_last']:,.0f} CZK")
+        print(f"  Umsatz (turnover):       {row['turnover']:,.0f} CZK")
+        print(f"  Alter:                   {row['age_at_event']:.1f} Jahre")
+        print(f"  Geschlecht:              {'M' if row['gender'] == 1 else 'F'}")
+        print(f"  Bezirksgehalt:           {row['district_avg_salary']:,.0f} CZK")
+    else:
+        print(f"Konto #{acc_id}: nicht in study_table")
+```
+
+### Interpretation: Baseline Features
+
+Die deskriptiven Statistiken zeigen plausible Wertebereiche:
+
+- **age_at_event:** Durchschnitt 45.5 Jahre (Std 16.2), Spanne 17–81. Die breite Altersverteilung bietet gutes Diskriminierungspotenzial.
+- **gender:** Nahezu ausgeglichen (51% männlich). Kein Geschlechter-Bias in der Stichprobe.
+- **district_avg_salary:** Durchschnitt 9'511 CZK (Std 1'321). Relativ geringe Streuung — die meisten Bezirke liegen im Bereich 8'100–12'500.
+- **balance_last:** Durchschnitt 34'025 CZK mit hoher Streuung (Std 19'153). Minimum negativ (-10'605 CZK), was auf überziehbare Konten hindeutet. Rechtsschief verteilt.
+- **turnover:** Durchschnitt 405'363 CZK, stark rechtsschief (Std 339'950). Einzelne Konten haben einen Umsatz von über 2 Mio. CZK.
+
+**Spot-Check:** Konto #14 (Vermögen 35'600, Umsatz 383K) und Konto #18 (Vermögen 39'294, Umsatz 1.14M) zeigen deutlich unterschiedliche Umsatzniveaus bei ähnlichem Vermögen — Konto #18 hat einen ~3× höheren Umsatz, was auf intensivere Kontonutzung hindeutet. Beide Werte sind konsistent mit den Zeitreihenplots aus Phase 1. Zu beachten: 2 Konten haben keine Transaktionen im Rollup-Fenster (NaN für `balance_last` und `turnover`).
+
+## Statische Features
+
+Zusätzlich zu den transaktionsbasierten Features fügen wir kontextuelle Informationen hinzu, die aus den statischen Tabellen (Bezirk, Kredit, Daueraufträge, Kontofrequenz) stammen. Diese Features verändern sich nicht innerhalb des Rollup-Fensters.
+
+**Temporale Einschränkung:** Kredite werden nur einbezogen, wenn `loan.date <= rollup_end`, um Data Leakage zu vermeiden.
+
+```{python}
+# === Statische Features berechnen ===
+static_features = compute_static_features(
+    study_table, client, disp, account, district, loan, order
+)
+
+print(f"Statische Features: {static_features.shape[1] - 1} Spalten (ohne account_id)")
+print(f"\nSpalten: {[c for c in static_features.columns if c != 'account_id']}")
+
+# Stichprobe
+print("\n--- Stichprobe (5 zufällige Konten) ---")
+sample = static_features.sample(5, random_state=RANDOM_STATE)
+print(sample.to_string(index=False))
+```
+
+## Feature Matrix zusammenführen
+
+Alle Feature-Gruppen (tsfresh, Baseline, Statisch) werden zu einer einzigen Feature-Matrix zusammengeführt. Die Matrix hat genau eine Zeile pro Konto und enthält `target` und `split` als Metadaten-Spalten.
+
+```{python}
+# === Feature Matrix zusammenführen ===
+feature_matrix = build_feature_matrix(
+    study_table=study_table,
+    trans=trans,
+    client=client,
+    disp=disp,
+    account=account,
+    district=district,
+    loan=loan,
+    order=order,
+    include_tsfresh=True,
+)
+
+feature_cols = [
+    c for c in feature_matrix.columns if c not in ("account_id", "target", "split")
+]
+print(f"\nFeature Matrix Shape: {feature_matrix.shape}")
+print(f"  Accounts: {feature_matrix.shape[0]}")
+print(f"  Features: {len(feature_cols)}")
+print(f"  Metadata: account_id, target, split")
+print(f"\nDtype-Übersicht:")
+print(feature_matrix[feature_cols].dtypes.value_counts().to_string())
+```
+
+```{python}
+# === Deliverable: Übersicht der selber konstruierten Predictive Features ===
+overview = get_feature_overview_table(feature_matrix)
+
+# Zusammenfassung nach Kategorie
+print("Feature-Übersicht nach Kategorie:")
+print(overview.groupby("category").size().sort_values(ascending=False).to_string())
+
+# Nicht-tsfresh Features im Detail
+non_tsf = overview[overview["category"] != "tsfresh (auto)"]
+print(f"\n--- Handgefertigte Features ({len(non_tsf)}) ---")
+print(
+    non_tsf[
+        ["feature_name", "category", "dtype", "mean", "std", "min", "max"]
+    ].to_string(index=False)
+)
+```
+
+```{python}
+# === Deliverable: Buyer vs Non-Buyer mit vollständigem Rollup ===
+
+ct = pd.crosstab(
+    feature_matrix["target"].map({0: "Nicht-Käufer (0)", 1: "Käufer (1)"}),
+    feature_matrix["split"],
+    margins=True,
+)
+print("=== Käufer vs. Nicht-Käufer mit vollständigem Rollup ===")
+print(ct.to_string())
+
+print(f"\nTotal Accounts mit Feature Matrix: {len(feature_matrix)}")
+print(f"  davon Käufer (Target=1):     {(feature_matrix['target'] == 1).sum()}")
+print(f"  davon Nicht-Käufer (Target=0): {(feature_matrix['target'] == 0).sum()}")
+```
+
+```{python}
+# === Feature-Verteilungen nach Target (Baseline Features) ===
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+plot_features = BASELINE_FEATURE_COLS + ["has_loan"]
+colors = {0: "C0", 1: "C1"}
+labels = {0: "Nicht-Käufer", 1: "Käufer"}
+
+for idx, feat in enumerate(plot_features):
+    ax = axes[idx // 3, idx % 3]
+    for t in [0, 1]:
+        subset = feature_matrix[feature_matrix["target"] == t]
+        if subset[feat].nunique() <= 5:
+            # Categorical/binary: bar chart
+            counts = subset[feat].value_counts().sort_index()
+            offset = -0.15 if t == 0 else 0.15
+            ax.bar(
+                counts.index + offset,
+                counts.values,
+                width=0.3,
+                alpha=0.7,
+                label=labels[t],
+                color=colors[t],
+            )
+        else:
+            sns.histplot(
+                subset[feat],
+                bins=25,
+                alpha=0.5,
+                label=labels[t],
+                ax=ax,
+                kde=True,
+                color=colors[t],
+            )
+    ax.set_title(feat)
+    ax.legend(fontsize=8)
+
+plt.suptitle("Feature-Verteilungen nach Target", fontsize=14, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+### Interpretation: Feature-Verteilungen nach Target
+
+Die Histogramme zeigen die Verteilung der Baseline-Features getrennt nach Käufern (Target=1) und Nicht-Käufern (Target=0):
+
+- **age_at_event:** Nicht-Käufer zeigen eine relativ gleichmässige Altersverteilung über alle Altersgruppen. Käufer hingegen konzentrieren sich stärker im Bereich 25–55 Jahre, mit einem deutlichen Rückgang bei Senioren (65+). Jüngere und mittelalte Kunden scheinen empfänglicher für Kreditkarten zu sein.
+- **gender:** Die Geschlechterverteilung ist in beiden Gruppen nahezu identisch — Geschlecht allein ist kein starker Prädiktor für Kreditkarten-Affinität.
+- **district_avg_salary:** Beide Gruppen haben eine ähnliche Verteilung, wobei Käufer eine leichte Tendenz zu höheren Durchschnittsgehältern zeigen (mehr Masse im rechten Bereich >10'000 CZK). Der Effekt ist aber subtil.
+- **balance_last:** Beide Gruppen sind rechtsschief verteilt. Käufer zeigen tendenziell etwas höhere Kontostände, aber die Verteilungen überlappen stark. Das Vermögen allein reicht nicht zur Unterscheidung.
+- **turnover:** Stark rechtsschief in beiden Gruppen. Käufer haben tendenziell einen etwas höheren Umsatz, aber auch hier gibt es grosse Überlappung. Die langen rechten Ausläufer deuten auf einige Konten mit sehr hohem Transaktionsvolumen hin.
+- **has_loan:** Käufer haben einen deutlich höheren Anteil an Kreditnehmern als Nicht-Käufer. Dies ist einer der stärksten univariaten Unterschiede — Kunden mit bestehendem Kredit sind eher bereit, auch eine Kreditkarte zu akzeptieren.
+
+**Fazit:** Kein einzelnes Baseline-Feature trennt die Gruppen vollständig — die Verteilungen überlappen erheblich. Die stärksten univariaten Signale kommen von `has_loan` und `age_at_event`. Für eine gute Klassifikation werden die Interaktionen zwischen Features und die tsfresh-Zeitreihenfeatures entscheidend sein.
+
+```{python}
+# === Korrelationsmatrix der handgefertigten Features ===
+
+hand_crafted_cols = [
+    c
+    for c in feature_matrix.columns
+    if c not in ("account_id", "target", "split")
+    and not c.startswith(TSFRESH_FEATURE_PREFIX)
+]
+
+corr = feature_matrix[hand_crafted_cols].corr()
+
+fig, ax = plt.subplots(figsize=(12, 10))
+mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+sns.heatmap(
+    corr,
+    mask=mask,
+    annot=True,
+    fmt=".2f",
+    cmap="viridis",
+    center=0,
+    vmin=-1,
+    vmax=1,
+    ax=ax,
+    square=True,
+    annot_kws={"size": 8},
+)
+ax.set_title("Korrelationsmatrix der handgefertigten Features")
+plt.tight_layout()
+plt.show()
+```
+
+### Interpretation: Korrelationsmatrix
+
+Die Heatmap zeigt die paarweisen Pearson-Korrelationen aller 22 handgefertigten Features. Auffällige Muster:
+
+**Starke positive Korrelationen (r > 0.7):**
+- **Bezirks-Features** bilden einen hochkorrelierten Block: `district_inhabitants`, `district_crimes_96`, `district_urban_ratio` und `district_avg_salary` korrelieren stark untereinander (r = 0.76–0.99). Grosse, urbane Bezirke haben gleichzeitig mehr Einwohner, höhere Gehälter und mehr Kriminalität. Diese Redundanz ist bei der Feature Selection zu beachten.
+- **Kredit-Features:** `has_loan`, `loan_amount`, `loan_monthly_payment` und `has_loan_order` sind erwartungsgemäss stark korreliert (r = 0.76–0.89), da sie alle vom Vorhandensein eines Kredits abhängen.
+- **`balance_last` ↔ `turnover`** (r = 0.54): Moderater Zusammenhang — Konten mit höherem Saldo haben tendenziell auch höheren Umsatz.
+
+**Negative Korrelationen:**
+- **`freq_monthly` ↔ `freq_weekly`** (r = -0.83): Erwartetes Artefakt der One-Hot-Kodierung — ein Konto kann nur eine Frequenz haben.
+- **`district_urban_ratio` ↔ `district_entrepreneurs`** (r = -0.72): In urbanen Bezirken gibt es anteilig weniger Unternehmer.
+
+**Geringe Korrelationen:**
+- `gender` zeigt nahezu keine Korrelation mit anderen Features (alle |r| < 0.12), was die geringe prädiktive Kraft bestätigt.
+- `months_to_event` ist weitgehend unabhängig von allen anderen Features.
+
+**Implikation für Modeling:** Die hohe Multikollinearität der Bezirks- und Kredit-Features ist für baumbasierte Modelle unproblematisch, könnte aber bei logistischer Regression die Koeffizienten-Interpretation erschweren. Eine Reduktion auf je einen Vertreter pro Block (z.B. `district_avg_salary` für Bezirk, `has_loan` für Kredit) wäre für das Baseline-Modell sinnvoll.
+
+```{python}
+# === tsfresh Feature Selection: Statistische Relevanz ===
+from tsfresh import select_features
+
+# Nur tsfresh Features für die Selektion
+tsf_cols = [c for c in feature_matrix.columns if c.startswith(TSFRESH_FEATURE_PREFIX)]
+X_tsf = feature_matrix[tsf_cols].copy()
+y = feature_matrix["target"].copy()
+
+# Nur Train-Daten für die Feature-Selektion verwenden (kein Leakage)
+train_mask = feature_matrix["split"] == "train"
+X_tsf_train = X_tsf[train_mask].copy()
+y_train = y[train_mask].copy()
+
+# NaN-Werte auffüllen (2 Accounts ohne Transaktionen im Rollup haben NaN für alle tsfresh Features)
+nan_rows = X_tsf_train.isna().any(axis=1).sum()
+if nan_rows > 0:
+    print(
+        f"Hinweis: {nan_rows} Accounts mit NaN in tsfresh Features (keine Transaktionen im Rollup) — werden mit 0 aufgefüllt"
+    )
+    X_tsf_train = X_tsf_train.fillna(0)
+
+print(f"tsfresh Features vor Selektion: {X_tsf_train.shape[1]}")
+X_selected = select_features(X_tsf_train, y_train)
+selected_cols = X_selected.columns.tolist()
+print(f"tsfresh Features nach Selektion: {len(selected_cols)}")
+print(
+    f"Reduktion: {X_tsf_train.shape[1] - len(selected_cols)} Features entfernt ({(1 - len(selected_cols)/X_tsf_train.shape[1])*100:.1f}%)"
+)
+print(f"\nTop-20 selektierte Features:")
+for col in selected_cols[:20]:
+    print(f"  {col}")
+```
+
+### Interpretation: tsfresh Feature Selection
+
+Die statistische Relevanztestung via `select_features()` (Benjamini-Hochberg-Korrektur) reduziert die tsfresh-Features um **60.3%** (von 1'554 auf 617). Die eliminierten 937 Features sind entweder konstant (323 mit Null-Varianz), statistisch nicht mit dem Target assoziiert, oder redundant.
+
+**Auffällig:** Die Top-20 selektierten Features stammen ausschliesslich aus der **`balance`-Zeitreihe**. Darunter dominieren:
+
+- **Quantile** (q=0.1 bis 0.9) und Lageparameter (`median`, `mean`): Das Niveau des Kontostands über den Rollup-Zeitraum ist der stärkste Prädiktor. Käufer haben tendenziell andere Saldo-Verteilungen.
+- **`c3` (Nichtlinearität)** mit verschiedenen Lags: Misst die nichtlineare Autokorrelation der Balance-Zeitreihe. Käufer- und Nicht-Käufer-Konten unterscheiden sich in der Dynamik ihres Kontostands.
+- **`abs_energy` / `root_mean_square`**: Mass für die Gesamtgrösse der Zeitreihenwerte — eng verwandt mit dem Saldo-Niveau.
+- **`benford_correlation`**: Prüft, ob die Ziffernverteilung der Balance-Werte dem Benfordschen Gesetz folgt — ein interessanter Hinweis auf unterschiedliche Transaktionsmuster.
+- **`fft_coefficient` (coeff_0)**: Der Gleichanteil der Fourier-Transformation, entspricht dem Mittelwert der Zeitreihe.
+
+**Implikation:** Der Kontostand (balance) ist informativer als der Transaktionsbetrag (amount) für die Vorhersage der Kreditkarten-Affinität. Das ist inhaltlich plausibel: Der Saldo reflektiert die finanzielle Stabilität und Kapazität eines Kunden besser als einzelne Transaktionsbeträge.
+
+```{python}
+# === Feature Matrix speichern ===
+import os
+
+os.makedirs(str(PATH_PROCESSED), exist_ok=True)
+feature_matrix.to_parquet(str(PATH_PROCESSED / "feature_matrix.parquet"), index=False)
+
+print(f"Feature Matrix gespeichert: {feature_matrix.shape}")
+print(f"  Pfad: {PATH_PROCESSED / 'feature_matrix.parquet'}")
+print(f"  Accounts: {feature_matrix.shape[0]}")
+print(f"  Features: {len(feature_cols)}")
+print(f"  Target=1: {(feature_matrix['target'] == 1).sum()}")
+print(f"  Target=0: {(feature_matrix['target'] == 0).sum()}")
+```
+
+## Zusammenfassung
+
+### Feature-Kategorien
+
+| Kategorie | Anzahl | Beschreibung |
+|---|---|---|
+| tsfresh (auto) | ~1'554 (~617 nach Selektion) | Automatisch extrahierte Zeitreihen-Features (Betrag + Saldo), 73 Funktionen × parametrisierte Varianten × 2 Zeitreihen |
+| Baseline | 5 | Alter, Geschlecht, Region, Vermögen, Umsatz |
+| District | 6 | Bezirksdemografie (Gehalt, Arbeitslosigkeit, Urban, Einwohner, Unternehmer, Kriminalität) |
+| Loan | 3 | Kreditstatus und -details (temporal guard) |
+| Order | 5 | Dauerauftrags-Aggregate und Kategorie-Flags |
+| Account | 4 | Kontofrequenz (One-Hot) + Kontoalter |
+
+### Nächste Schritte (Phase 3: Modeling)
+
+1. **Baseline-Modell:** Logistische Regression mit den 5 Baseline-Features
+2. **Kandidatenmodelle:** RandomForest, XGBoost, LightGBM, CatBoost mit allen Features
+3. **Feature Selection:** tsfresh `select_features()` reduziert die Auto-Features auf statistisch relevante (~617 von ~1'554)
+4. **Hyperparameter-Tuning:** GridSearch/RandomizedSearch mit stratifizierter k-Fold CV
+5. **Evaluation:** ROC-AUC, Precision, Recall, Lift Curve
+
