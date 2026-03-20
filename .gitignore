@@ -5,3 +5,5 @@ example/
 CLAUDE.md
 .idea/
 REFERENCES.md
+wandb/
+notebooks/wandb/

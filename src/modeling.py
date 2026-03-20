@@ -31,7 +31,12 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
 )
 
-from src.features import BASELINE_FEATURE_COLS, STATIC_FEATURE_COLS
+from src.features import (
+    BASELINE_FEATURE_COLS,
+    STATIC_FEATURE_COLS,
+    BEHAVIORAL_FEATURE_COLS,
+    WINDOW_FEATURE_COLS,
+)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -51,8 +56,9 @@ def get_feature_sets(fm: pd.DataFrame) -> dict[str, list[str]]:
     Return dict of feature set names to column lists.
 
     - 'baseline': 5 assignment-required features
-    - 'static_all': 22 static/contextual features (superset of baseline)
-    - 'all_features': all ~1576 features
+    - 'static_all': 20 static/contextual features (superset of baseline excl. balance_last, turnover)
+    - 'handcrafted': baseline + static + behavioral + window (~65 features, NO tsfresh)
+    - 'all_features': all features including tsfresh
     """
     meta_cols = {"account_id", "target", "split"}
     all_features = [c for c in fm.columns if c not in meta_cols]
@@ -60,9 +66,25 @@ def get_feature_sets(fm: pd.DataFrame) -> dict[str, list[str]]:
     # Static features that actually exist in fm
     static_all = [c for c in STATIC_FEATURE_COLS if c in fm.columns]
 
+    # Handcrafted = baseline + static + behavioral + window (no tsfresh)
+    handcrafted_candidates = (
+        BASELINE_FEATURE_COLS
+        + [c for c in STATIC_FEATURE_COLS if c not in BASELINE_FEATURE_COLS]
+        + BEHAVIORAL_FEATURE_COLS
+        + WINDOW_FEATURE_COLS
+    )
+    # Deduplicate while preserving order
+    seen = set()
+    handcrafted = []
+    for c in handcrafted_candidates:
+        if c in fm.columns and c not in seen:
+            handcrafted.append(c)
+            seen.add(c)
+
     return {
         "baseline": [c for c in BASELINE_FEATURE_COLS if c in fm.columns],
         "static_all": static_all,
+        "handcrafted": handcrafted,
         "all_features": all_features,
     }
 

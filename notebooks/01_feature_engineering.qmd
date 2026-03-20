@@ -12,18 +12,14 @@ lang: de
 jupyter: python3
 ---
 
-INFO:
-- die tsfresh bibliothek nimmt derzeit das ganze signal. folgendes fehlt: Solche Window-Vergleichs-Features könnte man manuell bauen, z.B.
-  - balance_mean_q1 vs. balance_mean_q4 → balance_trend_q1_q4
-  - turnover_first_half vs. turnover_second_half                                                                                         
-  - Monatliche Aggregation → Slope über die 12 monatlichen Mittelwerte
-
 In dieser Phase wird der **Client Analytical Record** erstellt — eine Zeile pro Konto mit allen prädiktiven Features. Grundlage ist die `study_table` aus Phase 1, die für jedes Konto das Rollup-Zeitfenster `[rollup_start, rollup_end]`, das Target-Label und den Train/Test-Split definiert.
 
 **Feature-Kategorien:**
-1. **tsfresh (automatisch):** ~1'500 Features aus Transaktions-Zeitreihen (Betrag & Saldo) via `EfficientFCParameters` (~777 pro Zeitreihe)
+1. **tsfresh (automatisch):** ~1'500 Features aus Transaktions-Zeitreihen (Betrag & Saldo) via `EfficientFCParameters`, reduziert auf ~100-200 durch Korrelations-Deduplizierung
 2. **Baseline (5 Features):** Alter, Geschlecht, Region, Vermögen, Umsatz — gemäss Aufgabenstellung
-3. **Statische Features:** Bezirk, Kredit, Daueraufträge, Kontofrequenz
+3. **Statische Features (20):** Bezirk, Kredit, Daueraufträge, Kontofrequenz
+4. **Behavioral Features (30):** Transaktionstyp-Ratios, Operationsmuster, Verwendungszweck, Aktivitätsmetriken
+5. **Window Features (12):** Temporale Sub-Fenster-Vergleiche (Quartal-/Halbjahrestrends, monatliche Steigung)
 
 ```{python}
 import sys
@@ -52,9 +48,13 @@ from src.features import (
     compute_tsfresh_features,
     compute_baseline_features,
     compute_static_features,
+    compute_behavioral_features,
+    compute_window_comparison_features,
     build_feature_matrix,
     get_feature_overview_table,
     BASELINE_FEATURE_COLS,
+    BEHAVIORAL_FEATURE_COLS,
+    WINDOW_FEATURE_COLS,
     TSFRESH_FEATURE_PREFIX,
 )
 
@@ -92,7 +92,10 @@ Raw Tables (8 CSVs)
     ├── trans (1M+ rows) ──► Rollup Filter [rollup_start, rollup_end] ──► trans_rollup (~280K rows)
     │                              │
     │                              ├── tsfresh EfficientFCParameters ──► ~1'500 auto Features (amount + balance)
-    │                              └── Baseline Aggregation ──► balance_last, turnover
+    │                              │       └── Correlation Dedup ──► ~100-200 unique tsfresh Features
+    │                              ├── Baseline Aggregation ──► balance_last, turnover
+    │                              ├── Behavioral Features ──► 30 Features (type, operation, k_symbol, bank, ratios)
+    │                              └── Window Comparison ──► 12 Features (Q1-Q4, H1-H2 trends, monthly slope)
     │
     ├── client + disp ──► age_at_event, gender
     ├── district ──► avg_salary, unemployment, urban_ratio, inhabitants, entrepreneurs, crimes
@@ -101,10 +104,13 @@ Raw Tables (8 CSVs)
     └── account ──► frequency one-hot, months_to_event
                               │
                               ▼
-                    Feature Matrix (1 row per account, ~1'580 features)
+                    Feature Matrix (1 row per account, ~250 features)
 ```
 
-**Hinweis:** tsfresh `EfficientFCParameters` enthält 73 Feature-Funktionen, von denen viele parametrisiert sind (z.B. FFT-Koeffizienten für 100 Frequenzen, Quantile für verschiedene q-Werte). Dadurch entstehen ~777 konkrete Features pro Zeitreihe statt ~73. Mit `select_features()` werden nach der Extraktion nur die statistisch relevanten Features beibehalten.
+**Neue Feature-Gruppen (Phase 3.1):**
+- **Behavioral (30):** Transaktionstyp-Ratios (`type`), Operationsmuster (`operation`), Verwendungszweck (`k_symbol`), Aktivitätsmetriken, abgeleitete Verhältnisse
+- **Window (12):** Quartal- und Halbjahresvergleiche innerhalb des 12-Monats-Fensters (Balance-Trend Q1→Q4, Umsatz-Trend H1→H2, monatliche Balance-Steigung)
+- **tsfresh Dedup:** Greedy-Selektion nach Target-Korrelation mit Pearson-Schwelle 0.95 reduziert ~1'500 auf ~100-200 Features
 
 **Leakage Guards:**
 - Transaktionen strikt auf `[rollup_start, rollup_end]` gefiltert (kein Lag-Zeitraum, keine Post-Event-Daten)
@@ -275,6 +281,138 @@ print(f"\nSpalten: {[c for c in static_features.columns if c != 'account_id']}")
 print("\n--- Stichprobe (5 zufällige Konten) ---")
 sample = static_features.sample(5, random_state=RANDOM_STATE)
 print(sample.to_string(index=False))
+```
+
+## Behavioral Features (30)
+
+Neue Features, die bisher ignorierte Transaktionsspalten nutzen: `type` (credit/withdrawal), `operation` (5 Operationsarten), `k_symbol` (Verwendungszweck), `bank` (externe Bankbeziehungen), sowie Aktivitäts- und Verhältnismetriken.
+
+| Gruppe | Features | Beschreibung |
+|---|---|---|
+| A — Volumen & Aktivität | 6 | Transaktionsanzahl, aktive Tage, Betrags-Statistiken, Saldo-Spannweite |
+| B — Typ-Ratios | 4 | Anteil Credit/Withdrawal, Verhältnis, Durchschnittsbetrag Credit |
+| C — Operationsmuster | 5 | Anteile der 5 Operationsarten (Bareinzahlung, Überweisung, etc.) |
+| D — Verwendungszweck | 5 | Anteile nach k_symbol (Rente, Versicherung, Haushalt, Kredit) + Diversität |
+| E — Temporale Muster | 6 | Tage zwischen Transaktionen, Wochenposition, externe Bankbeziehungen |
+| F — Abgeleitete Ratios | 4 | Umsatz pro Transaktion, Saldo/Umsatz-Verhältnis, Netto-Fluss |
+
+```{python}
+# === Behavioral Features berechnen ===
+behavioral_features = compute_behavioral_features(trans_rollup, study_table)
+
+print(
+    f"Behavioral Features: {behavioral_features.shape[1] - 1} Spalten (ohne account_id)"
+)
+print(f"\nSpalten: {BEHAVIORAL_FEATURE_COLS}")
+
+# Descriptive stats
+print("\n--- Deskriptive Statistik ---")
+print(behavioral_features[BEHAVIORAL_FEATURE_COLS].describe().round(3).to_string())
+```
+
+```{python}
+# === Behavioral Features: Verteilungen nach Target ===
+# Merge target for plotting
+beh_with_target = behavioral_features.merge(
+    study_table[["account_id", "target"]], on="account_id"
+)
+
+# Select most informative behavioral features for visualization
+plot_beh_features = [
+    "n_transactions",
+    "avg_amount",
+    "balance_range",
+    "pct_type_credit",
+    "credit_withdrawal_ratio",
+    "avg_credit_amount",
+    "pct_op_collection_from_another_bank",
+    "pct_ksym_old_age_pension",
+    "n_distinct_ksymbols",
+]
+
+fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+labels = {0: "Nicht-Käufer", 1: "Käufer"}
+colors = {0: "C0", 1: "C1"}
+
+for idx, feat in enumerate(plot_beh_features):
+    ax = axes[idx // 3, idx % 3]
+    for t in [0, 1]:
+        subset = beh_with_target[beh_with_target["target"] == t]
+        sns.histplot(
+            subset[feat],
+            bins=25,
+            alpha=0.5,
+            label=labels[t],
+            ax=ax,
+            kde=True,
+            color=colors[t],
+        )
+    ax.set_title(feat)
+    ax.legend(fontsize=8)
+
+plt.suptitle(
+    "Behavioral Features — Verteilung nach Target",
+    fontsize=14,
+    fontweight="bold",
+    y=1.02,
+)
+plt.tight_layout()
+plt.show()
+```
+
+## Window Comparison Features (12)
+
+Temporale Sub-Fenster innerhalb des 12-Monats-Rollup: Vergleicht Kontoverhalten zwischen Quartalen (Q1=älteste 3 Monate, Q4=neueste 3 Monate) und Halbjahren (H1/H2). Erlaubt die Erfassung von **Trends** wie "Saldo wächst" oder "Umsatz beschleunigt sich".
+
+```{python}
+# === Window Comparison Features berechnen ===
+window_features = compute_window_comparison_features(trans_rollup, study_table)
+
+print(f"Window Features: {window_features.shape[1] - 1} Spalten (ohne account_id)")
+print(f"\nSpalten: {WINDOW_FEATURE_COLS}")
+
+# Descriptive stats
+print("\n--- Deskriptive Statistik ---")
+print(window_features[WINDOW_FEATURE_COLS].describe().round(2).to_string())
+```
+
+```{python}
+# === Window Features: Verteilungen nach Target ===
+win_with_target = window_features.merge(
+    study_table[["account_id", "target"]], on="account_id"
+)
+
+plot_win_features = [
+    "balance_trend_q1_q4",
+    "balance_trend_q1_q4_pct",
+    "turnover_trend_h1_h2",
+    "turnover_trend_h1_h2_pct",
+    "tx_count_trend_h1_h2",
+    "monthly_balance_slope",
+]
+
+fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+for idx, feat in enumerate(plot_win_features):
+    ax = axes[idx // 3, idx % 3]
+    for t in [0, 1]:
+        subset = win_with_target[win_with_target["target"] == t]
+        sns.histplot(
+            subset[feat],
+            bins=25,
+            alpha=0.5,
+            label=labels[t],
+            ax=ax,
+            kde=True,
+            color=colors[t],
+        )
+    ax.set_title(feat)
+    ax.legend(fontsize=8)
+
+plt.suptitle(
+    "Window Features — Verteilung nach Target", fontsize=14, fontweight="bold", y=1.02
+)
+plt.tight_layout()
+plt.show()
 ```
 
 ## Feature Matrix zusammenführen
@@ -515,18 +653,20 @@ print(f"  Target=0: {(feature_matrix['target'] == 0).sum()}")
 
 | Kategorie | Anzahl | Beschreibung |
 |---|---|---|
-| tsfresh (auto) | ~1'554 (~617 nach Selektion) | Automatisch extrahierte Zeitreihen-Features (Betrag + Saldo), 73 Funktionen × parametrisierte Varianten × 2 Zeitreihen |
+| tsfresh (auto) | ~100-200 (nach Dedup) | Automatisch extrahierte Zeitreihen-Features (Betrag + Saldo), dedupliziert via Korrelationsschwelle 0.95 |
 | Baseline | 5 | Alter, Geschlecht, Region, Vermögen, Umsatz |
 | District | 6 | Bezirksdemografie (Gehalt, Arbeitslosigkeit, Urban, Einwohner, Unternehmer, Kriminalität) |
 | Loan | 3 | Kreditstatus und -details (temporal guard) |
 | Order | 5 | Dauerauftrags-Aggregate und Kategorie-Flags |
 | Account | 4 | Kontofrequenz (One-Hot) + Kontoalter |
+| Behavioral | 30 | Transaktionstyp-Ratios, Operationsmuster, Verwendungszweck, Aktivität, Verhältnisse |
+| Window | 12 | Quartal-/Halbjahresvergleiche, monatliche Balance-Steigung |
 
 ### Nächste Schritte (Phase 3: Modeling)
 
 1. **Baseline-Modell:** Logistische Regression mit den 5 Baseline-Features
-2. **Kandidatenmodelle:** RandomForest, XGBoost, LightGBM, CatBoost mit allen Features
-3. **Feature Selection:** tsfresh `select_features()` reduziert die Auto-Features auf statistisch relevante (~617 von ~1'554)
-4. **Hyperparameter-Tuning:** GridSearch/RandomizedSearch mit stratifizierter k-Fold CV
+2. **Handcrafted-Modell:** Logistische Regression mit ~65 handgefertigten Features (ohne tsfresh)
+3. **Kandidatenmodelle:** RandomForest, HistGBT mit allen ~250 Features
+4. **Hyperparameter-Tuning:** RandomizedSearch mit stratifizierter k-Fold CV
 5. **Evaluation:** ROC-AUC, Precision, Recall, Lift Curve
 

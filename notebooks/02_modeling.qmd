@@ -16,12 +16,10 @@ In dieser Phase werden **prädiktive Modelle** trainiert und validiert. Ziel ist
 
 **Modelle:**
 1. **Baseline:** Logistische Regression mit 5 Features (Aufgabenanforderung)
-2. **Erweitert:** Logistische Regression mit 20 statischen Features
-3. **Random Forest** — Alle ~1'576 Features
-4. **HistGradient Boosting (balanced)** — Alle ~1'576 Features, mit class_weight
-5. **HistGradient Boosting (unweighted)** — Alle ~1'576 Features, ohne class_weight
-
-*Hinweis:* `GradientBoostingClassifier` wurde durch eine zweite HistGBT-Variante ersetzt, da GBC kein `n_jobs` unterstützt und bei ~1'576 Features prohibitiv langsam ist (>8h geschätzt). `HistGradientBoosting` nutzt Histogramm-basierte Splits und ist 10-100× schneller.
+2. **Handcrafted:** Logistische Regression mit ~65 handgefertigten Features (Baseline + Static + Behavioral + Window, ohne tsfresh)
+3. **Random Forest** — Alle ~250 Features (inkl. deduplizierte tsfresh)
+4. **HistGradient Boosting (balanced)** — Alle ~250 Features, mit class_weight
+5. **HistGradient Boosting (unweighted)** — Alle ~250 Features, ohne class_weight
 
 **Methodik:** StratifiedKFold (k=5) Cross-Validation auf dem Training-Set, finale Evaluation auf dem gehaltenen Test-Set. `class_weight="balanced"` wo angegeben.
 
@@ -81,9 +79,10 @@ import atexit
 
 run = wandb.init(
     project="aml-credit-card-affinity",
-    name="phase3-modeling",
+    name="phase3-modeling-v2",
     config={"random_state": RANDOM_STATE, "cv_folds": 5},
-    reinit=True,
+    reinit="finish_previous",
+    settings=wandb.Settings(save_code=False),
 )
 
 # Safety: finish run even if kernel crashes or is interrupted
@@ -177,60 +176,58 @@ for metric in SCORING_METRICS:
     print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
 ```
 
-# Erweiterte Logistische Regression (22 statische Features)
+# Handcrafted Logistische Regression (~65 Features)
 
-Zum Vergleich: Logistische Regression mit allen statischen/kontextuellen Features (Bezirk, Kredit, Daueraufträge, Kontofrequenz) — ohne tsfresh-Features.
+Logistische Regression mit allen handgefertigten Features: Baseline (5) + statische/kontextuelle (15) + Behavioral (30) + Window (12) = ~65 Features. Ohne tsfresh — zeigt den Wert der Domain-Features.
 
 ```{python}
-static_cols = feature_sets["static_all"]
-print(f"Statische Features ({len(static_cols)}):", static_cols)
+handcrafted_cols = feature_sets["handcrafted"]
+print(f"Handcrafted Features ({len(handcrafted_cols)}):", handcrafted_cols)
 
-X_train_st = X_train_all[static_cols]
-X_test_st = X_test_all[static_cols]
+X_train_hc = X_train_all[handcrafted_cols]
+X_test_hc = X_test_all[handcrafted_cols]
 
-pipe_st = build_pipeline(
+pipe_hc = build_pipeline(
     LogisticRegression(
         class_weight="balanced",
         solver="lbfgs",
         max_iter=1000,
         random_state=RANDOM_STATE,
     ),
-    feature_cols=static_cols,
+    feature_cols=handcrafted_cols,
     scale=True,
 )
 
-gs_st = GridSearchCV(
-    pipe_st,
+gs_hc = GridSearchCV(
+    pipe_hc,
     param_grid_logreg,
     scoring=SCORING_PRIMARY,
     cv=cv,
     n_jobs=-1,
     refit=True,
 )
-gs_st.fit(X_train_st, y_train)
+gs_hc.fit(X_train_hc, y_train)
 
-print(f"Bester C: {gs_st.best_params_['model__C']}")
-print(f"Beste CV ROC-AUC: {gs_st.best_score_:.4f}")
+print(f"Bester C: {gs_hc.best_params_['model__C']}")
+print(f"Beste CV ROC-AUC: {gs_hc.best_score_:.4f}")
 
-cv_st = cross_validate(
-    gs_st.best_estimator_,
-    X_train_st,
+cv_hc = cross_validate(
+    gs_hc.best_estimator_,
+    X_train_hc,
     y_train,
     scoring=SCORING_METRICS,
     cv=cv,
     n_jobs=-1,
 )
-print("\nCV-Metriken (Erweiterte LogReg):")
+print("\nCV-Metriken (Handcrafted LogReg):")
 for metric in SCORING_METRICS:
-    vals = cv_st[f"test_{metric}"]
+    vals = cv_hc[f"test_{metric}"]
     print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
 ```
 
 # Kandidatenmodelle (Tree-basiert)
 
-Drei Ensemble-Modelle mit **allen ~1'576 Features** (inkl. tsfresh). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=30).
-
-`GradientBoostingClassifier` wurde bewusst nicht verwendet: Ohne `n_jobs`-Support wären 30 Iterationen × 5 Folds = 150 sequentielle Fits auf 1'576 Features nötig gewesen (~8h+). `HistGradientBoostingClassifier` nutzt Histogramm-basierte Splits und ist bei vielen Features 10-100× schneller.
+Drei Ensemble-Modelle mit **allen ~250 Features** (inkl. deduplizierte tsfresh + behavioral + window). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=30).
 
 ```{python}
 all_cols = feature_sets["all_features"]
@@ -345,7 +342,7 @@ Vergleich aller 5 Modelle anhand der CV-Metriken auf dem Training-Set.
 # Collect all CV results
 all_cv = {
     "Baseline LogReg (5)": cv_bl,
-    "Extended LogReg (22)": cv_st,
+    "Handcrafted LogReg": cv_hc,
 }
 for name, search in best_candidates.items():
     all_cv[name] = cv_results_candidates[name]
@@ -416,10 +413,10 @@ res_bl = evaluate_on_test(gs_bl.best_estimator_, X_test_bl, y_test)
 res_bl["y_true"] = y_test.values
 test_results["Baseline LogReg (5)"] = res_bl
 
-# Extended LogReg
-res_st = evaluate_on_test(gs_st.best_estimator_, X_test_st, y_test)
-res_st["y_true"] = y_test.values
-test_results["Extended LogReg (22)"] = res_st
+# Handcrafted LogReg
+res_hc = evaluate_on_test(gs_hc.best_estimator_, X_test_hc, y_test)
+res_hc["y_true"] = y_test.values
+test_results["Handcrafted LogReg"] = res_hc
 
 # Tree-based candidates
 for name, search in best_candidates.items():
@@ -551,16 +548,25 @@ plt.show()
 Feature Importance zeigt, welche Merkmale die Modelle am stärksten für ihre Vorhersagen nutzen. Dies hilft beim Verständnis der Zielgruppe und bei der Validierung, dass die Modelle sinnvolle Muster lernen.
 
 ```{python}
-# Built-in feature importance for tree models
+# Permutation importance for all tree-based candidates (on test set)
+# Using permutation_importance instead of built-in feature_importances_
+# to ensure compatibility with all model types
 for name, search in best_candidates.items():
-    model = search.best_estimator_.named_steps["model"]
-
-    if hasattr(model, "feature_importances_"):
-        imp = pd.Series(model.feature_importances_, index=all_cols)
-        fig = plot_feature_importance(imp, name)
-        fig.tight_layout()
-        wandb.log({f"feature_importance_{name}": wandb.Image(fig)})
-        plt.show()
+    print(f"\nBerechne Permutation Importance für {name}...")
+    perm_result = permutation_importance(
+        search.best_estimator_,
+        X_test_all,
+        y_test,
+        scoring=SCORING_PRIMARY,
+        n_repeats=10,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    imp = pd.Series(perm_result.importances_mean, index=all_cols)
+    fig = plot_feature_importance(imp, f"{name} (Permutation)")
+    fig.tight_layout()
+    wandb.log({f"feature_importance_{name}": wandb.Image(fig)})
+    plt.show()
 ```
 
 ```{python}
@@ -573,9 +579,9 @@ print(f"Bestes Modell (nach Test ROC-AUC): {best_model_name}")
 if best_model_name in best_candidates:
     best_pipe = best_candidates[best_model_name].best_estimator_
     X_perm = X_test_all
-elif best_model_name == "Extended LogReg (22)":
-    best_pipe = gs_st.best_estimator_
-    X_perm = X_test_st
+elif best_model_name == "Handcrafted LogReg":
+    best_pipe = gs_hc.best_estimator_
+    X_perm = X_test_hc
 else:
     best_pipe = gs_bl.best_estimator_
     X_perm = X_test_bl
@@ -594,21 +600,28 @@ perm_result = permutation_importance(
 perm_imp = pd.Series(perm_result.importances_mean, index=X_perm.columns)
 fig = plot_feature_importance(perm_imp, f"{best_model_name} (Permutation)")
 fig.tight_layout()
-wandb.log({"permutation_importance": wandb.Image(fig)})
+wandb.log({"permutation_importance_best": wandb.Image(fig)})
 plt.show()
 ```
 
 ```{python}
-# Compare top-20 features across tree models
+# Compare top-20 features across tree models (using permutation importance)
 top_features_all = {}
 for name, search in best_candidates.items():
-    model = search.best_estimator_.named_steps["model"]
-    if hasattr(model, "feature_importances_"):
-        imp = pd.Series(model.feature_importances_, index=all_cols)
-        top_features_all[name] = imp.nlargest(20).index.tolist()
+    perm_result = permutation_importance(
+        search.best_estimator_,
+        X_test_all,
+        y_test,
+        scoring=SCORING_PRIMARY,
+        n_repeats=10,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    imp = pd.Series(perm_result.importances_mean, index=all_cols)
+    top_features_all[name] = imp.nlargest(20).index.tolist()
 
 if top_features_all:
-    print("Top-20 Features pro Modell:\n")
+    print("Top-20 Features pro Modell (Permutation Importance):\n")
     top_df = pd.DataFrame(
         {name: pd.Series(feats) for name, feats in top_features_all.items()}
     )
@@ -642,8 +655,8 @@ for name, res in test_results.items():
     # Determine feature count
     if "(5)" in name:
         n_feat = 5
-    elif "(22)" in name:
-        n_feat = len(static_cols)
+    elif "Handcrafted" in name:
+        n_feat = len(handcrafted_cols)
     else:
         n_feat = len(all_cols)
 
