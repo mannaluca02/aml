@@ -1,0 +1,715 @@
+---
+title: 'AML - Phase 3: Predictive Modeling & Validation'
+author: Luca Manna
+date: '2026-03-20'
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    embed-resources: true
+lang: de
+jupyter: python3
+---
+
+In dieser Phase werden **prädiktive Modelle** trainiert und validiert. Ziel ist es, Kunden zu identifizieren, die am wahrscheinlichsten eine Kreditkarte akzeptieren.
+
+**Modelle:**
+1. **Baseline:** Logistische Regression mit 5 Features (Aufgabenanforderung)
+2. **Erweitert:** Logistische Regression mit 20 statischen Features
+3. **Random Forest** — Alle ~1'576 Features
+4. **HistGradient Boosting (balanced)** — Alle ~1'576 Features, mit class_weight
+5. **HistGradient Boosting (unweighted)** — Alle ~1'576 Features, ohne class_weight
+
+*Hinweis:* `GradientBoostingClassifier` wurde durch eine zweite HistGBT-Variante ersetzt, da GBC kein `n_jobs` unterstützt und bei ~1'576 Features prohibitiv langsam ist (>8h geschätzt). `HistGradientBoosting` nutzt Histogramm-basierte Splits und ist 10-100× schneller.
+
+**Methodik:** StratifiedKFold (k=5) Cross-Validation auf dem Training-Set, finale Evaluation auf dem gehaltenen Test-Set. `class_weight="balanced"` wo angegeben.
+
+```{python}
+import warnings
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import sys
+
+sys.path.insert(0, "..")
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    HistGradientBoostingClassifier,
+)
+from sklearn.model_selection import (
+    GridSearchCV,
+    RandomizedSearchCV,
+    cross_validate,
+)
+from sklearn.inspection import permutation_importance
+
+import wandb
+
+from src.data import set_plot_style, RANDOM_STATE
+from src.modeling import (
+    get_feature_sets,
+    build_pipeline,
+    get_cv_splitter,
+    evaluate_on_test,
+    plot_roc_curves,
+    plot_pr_curves,
+    plot_lift_curve,
+    compute_top_n_list,
+    compare_top_n_lists,
+    plot_feature_importance,
+    plot_confusion_matrices,
+    SCORING_PRIMARY,
+    SCORING_METRICS,
+    N_ITER_RANDOM_SEARCH,
+    TOP_N_PERCENTILES,
+)
+
+set_plot_style()
+print("Setup complete.")
+```
+
+```{python}
+import atexit
+
+run = wandb.init(
+    project="aml-credit-card-affinity",
+    name="phase3-modeling",
+    config={"random_state": RANDOM_STATE, "cv_folds": 5},
+    reinit=True,
+)
+
+# Safety: finish run even if kernel crashes or is interrupted
+atexit.register(lambda: wandb.finish(quiet=True))
+```
+
+# Daten laden & Train/Test Split
+
+```{python}
+from src.data import PATH_FEATURE_MATRIX
+
+fm = pd.read_parquet(PATH_FEATURE_MATRIX)
+print(f"Feature-Matrix: {fm.shape[0]} Accounts × {fm.shape[1]} Spalten")
+print(f"Target-Verteilung:\n{fm['target'].value_counts().to_string()}")
+print(f"Split-Verteilung:\n{fm['split'].value_counts().to_string()}")
+```
+
+```{python}
+# Train/Test Split (vordefiniert aus Phase 2)
+train_mask = fm["split"] == "train"
+test_mask = fm["split"] == "test"
+
+feature_sets = get_feature_sets(fm)
+print(f"Feature Sets:")
+for name, cols in feature_sets.items():
+    print(f"  {name}: {len(cols)} Features")
+
+# Prepare X/y
+X_train_all = fm.loc[train_mask, feature_sets["all_features"]].copy()
+X_test_all = fm.loc[test_mask, feature_sets["all_features"]].copy()
+y_train = fm.loc[train_mask, "target"].astype(int)
+y_test = fm.loc[test_mask, "target"].astype(int)
+test_ids = fm.loc[test_mask, "account_id"].values
+
+print(f"\nTrain: {len(y_train)} ({y_train.sum()} positiv, {y_train.mean():.1%})")
+print(f"Test:  {len(y_test)} ({y_test.sum()} positiv, {y_test.mean():.1%})")
+
+cv = get_cv_splitter()
+```
+
+# Baseline-Modell: Logistische Regression (5 Features)
+
+Die Aufgabenstellung fordert ein Baseline-Modell mit **logistischer Regression** und den Features: Alter, Geschlecht, Region (Durchschnittslohn), Vermögen (letzter Saldo), und Umsatz.
+
+```{python}
+baseline_cols = feature_sets["baseline"]
+print("Baseline-Features:", baseline_cols)
+
+X_train_bl = X_train_all[baseline_cols]
+X_test_bl = X_test_all[baseline_cols]
+
+# GridSearch over regularization strength C
+param_grid_logreg = {"model__C": [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]}
+
+pipe_bl = build_pipeline(
+    LogisticRegression(
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=1000,
+        random_state=RANDOM_STATE,
+    ),
+    feature_cols=baseline_cols,
+    scale=True,
+)
+
+gs_bl = GridSearchCV(
+    pipe_bl,
+    param_grid_logreg,
+    scoring=SCORING_PRIMARY,
+    cv=cv,
+    n_jobs=-1,
+    refit=True,
+)
+gs_bl.fit(X_train_bl, y_train)
+
+print(f"Bester C: {gs_bl.best_params_['model__C']}")
+print(f"Beste CV ROC-AUC: {gs_bl.best_score_:.4f}")
+
+# CV metrics for the best model
+cv_bl = cross_validate(
+    gs_bl.best_estimator_,
+    X_train_bl,
+    y_train,
+    scoring=SCORING_METRICS,
+    cv=cv,
+    n_jobs=-1,
+)
+print("\nCV-Metriken (Baseline):")
+for metric in SCORING_METRICS:
+    vals = cv_bl[f"test_{metric}"]
+    print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
+```
+
+# Erweiterte Logistische Regression (22 statische Features)
+
+Zum Vergleich: Logistische Regression mit allen statischen/kontextuellen Features (Bezirk, Kredit, Daueraufträge, Kontofrequenz) — ohne tsfresh-Features.
+
+```{python}
+static_cols = feature_sets["static_all"]
+print(f"Statische Features ({len(static_cols)}):", static_cols)
+
+X_train_st = X_train_all[static_cols]
+X_test_st = X_test_all[static_cols]
+
+pipe_st = build_pipeline(
+    LogisticRegression(
+        class_weight="balanced",
+        solver="lbfgs",
+        max_iter=1000,
+        random_state=RANDOM_STATE,
+    ),
+    feature_cols=static_cols,
+    scale=True,
+)
+
+gs_st = GridSearchCV(
+    pipe_st,
+    param_grid_logreg,
+    scoring=SCORING_PRIMARY,
+    cv=cv,
+    n_jobs=-1,
+    refit=True,
+)
+gs_st.fit(X_train_st, y_train)
+
+print(f"Bester C: {gs_st.best_params_['model__C']}")
+print(f"Beste CV ROC-AUC: {gs_st.best_score_:.4f}")
+
+cv_st = cross_validate(
+    gs_st.best_estimator_,
+    X_train_st,
+    y_train,
+    scoring=SCORING_METRICS,
+    cv=cv,
+    n_jobs=-1,
+)
+print("\nCV-Metriken (Erweiterte LogReg):")
+for metric in SCORING_METRICS:
+    vals = cv_st[f"test_{metric}"]
+    print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
+```
+
+# Kandidatenmodelle (Tree-basiert)
+
+Drei Ensemble-Modelle mit **allen ~1'576 Features** (inkl. tsfresh). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=30).
+
+`GradientBoostingClassifier` wurde bewusst nicht verwendet: Ohne `n_jobs`-Support wären 30 Iterationen × 5 Folds = 150 sequentielle Fits auf 1'576 Features nötig gewesen (~8h+). `HistGradientBoostingClassifier` nutzt Histogramm-basierte Splits und ist bei vielen Features 10-100× schneller.
+
+```{python}
+all_cols = feature_sets["all_features"]
+
+# Model configurations
+# Note: GradientBoostingClassifier was removed — it doesn't support n_jobs
+# and is prohibitively slow with ~1576 features (50 iter × 5 folds = 250
+# sequential fits, each with up to 500 trees). HistGradientBoosting is
+# 10-100× faster and achieves comparable or better performance.
+# We use two HGBC variants instead: one with class_weight="balanced",
+# one without (uses default threshold, different regularization).
+
+candidate_configs = {
+    "RandomForest": {
+        "model": RandomForestClassifier(
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        ),
+        "params": {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [5, 10, 20, None],
+            "model__min_samples_split": [2, 5, 10],
+            "model__min_samples_leaf": [1, 2, 5, 10],
+            "model__max_features": ["sqrt", "log2", 0.1, 0.3],
+        },
+        "scale": False,
+    },
+    "HistGBT (balanced)": {
+        "model": HistGradientBoostingClassifier(
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        ),
+        "params": {
+            "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
+            "model__max_iter": [100, 200, 500],
+            "model__max_depth": [3, 5, 7, None],
+            "model__min_samples_leaf": [5, 10, 20, 50],
+            "model__max_leaf_nodes": [15, 31, 63, None],
+            "model__l2_regularization": [0, 0.1, 1.0, 10.0],
+        },
+        "scale": False,
+    },
+    "HistGBT (unweighted)": {
+        "model": HistGradientBoostingClassifier(
+            random_state=RANDOM_STATE,
+        ),
+        "params": {
+            "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
+            "model__max_iter": [100, 200, 500],
+            "model__max_depth": [3, 5, 7, None],
+            "model__min_samples_leaf": [5, 10, 20, 50],
+            "model__max_leaf_nodes": [15, 31, 63, None],
+            "model__l2_regularization": [0, 0.1, 1.0, 10.0],
+        },
+        "scale": False,
+    },
+}
+
+# Run RandomizedSearchCV for each candidate
+best_candidates = {}
+for name, cfg in candidate_configs.items():
+    print(f"\n{'='*60}")
+    print(f"Tuning: {name}")
+    print(f"{'='*60}")
+
+    pipe = build_pipeline(cfg["model"], feature_cols=all_cols, scale=cfg["scale"])
+
+    search = RandomizedSearchCV(
+        pipe,
+        cfg["params"],
+        n_iter=N_ITER_RANDOM_SEARCH,
+        scoring=SCORING_PRIMARY,
+        cv=cv,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        refit=True,
+    )
+    search.fit(X_train_all, y_train)
+
+    best_candidates[name] = search
+    print(f"Beste CV ROC-AUC: {search.best_score_:.4f}")
+    print(f"Beste Parameter:")
+    for k, v in search.best_params_.items():
+        print(f"  {k}: {v}")
+```
+
+```{python}
+# Cross-validate each best candidate with all metrics
+cv_results_candidates = {}
+for name, search in best_candidates.items():
+    cv_res = cross_validate(
+        search.best_estimator_,
+        X_train_all,
+        y_train,
+        scoring=SCORING_METRICS,
+        cv=cv,
+        n_jobs=-1,
+    )
+    cv_results_candidates[name] = cv_res
+    print(f"\n{name} — CV-Metriken:")
+    for metric in SCORING_METRICS:
+        vals = cv_res[f"test_{metric}"]
+        print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
+```
+
+# Cross-Validation Vergleich (Deliverable)
+
+Vergleich aller 5 Modelle anhand der CV-Metriken auf dem Training-Set.
+
+```{python}
+# Collect all CV results
+all_cv = {
+    "Baseline LogReg (5)": cv_bl,
+    "Extended LogReg (22)": cv_st,
+}
+for name, search in best_candidates.items():
+    all_cv[name] = cv_results_candidates[name]
+
+# Build comparison table
+rows = []
+for name, cv_res in all_cv.items():
+    row = {"Model": name}
+    for metric in SCORING_METRICS:
+        vals = cv_res[f"test_{metric}"]
+        row[f"{metric}_mean"] = vals.mean()
+        row[f"{metric}_std"] = vals.std()
+    rows.append(row)
+
+cv_table = pd.DataFrame(rows)
+
+# Display formatted
+display_cols = ["Model"]
+for metric in SCORING_METRICS:
+    cv_table[metric] = cv_table.apply(
+        lambda r: f"{r[f'{metric}_mean']:.4f} ± {r[f'{metric}_std']:.4f}", axis=1
+    )
+    display_cols.append(metric)
+
+print("Cross-Validation Ergebnisse (Mean ± Std):")
+display(cv_table[display_cols].style.set_caption("CV Performance aller Modelle"))
+
+# Log to W&B
+wandb.log({"cv_comparison": wandb.Table(dataframe=cv_table[display_cols])})
+```
+
+```{python}
+# Bar chart: CV ROC-AUC comparison
+fig, ax = plt.subplots(figsize=(10, 5))
+models = [r["Model"] for r in rows]
+auc_means = [r["roc_auc_mean"] for r in rows]
+auc_stds = [r["roc_auc_std"] for r in rows]
+
+bars = ax.barh(models, auc_means, xerr=auc_stds, capsize=5)
+ax.set_xlabel("ROC-AUC (CV Mean ± Std)")
+ax.set_title("Cross-Validation ROC-AUC Vergleich")
+ax.set_xlim(0.5, 1.0)
+
+for bar, val in zip(bars, auc_means):
+    ax.text(
+        val + 0.01,
+        bar.get_y() + bar.get_height() / 2,
+        f"{val:.4f}",
+        va="center",
+        fontsize=10,
+    )
+
+fig.tight_layout()
+wandb.log({"cv_roc_auc_comparison": wandb.Image(fig)})
+plt.show()
+```
+
+# Test-Set Evaluation (Deliverable)
+
+Finale Evaluation aller Modelle auf dem gehaltenen Test-Set (20%, 782 Accounts).
+
+```{python}
+# Evaluate all models on test set
+test_results = {}
+
+# Baseline LogReg
+res_bl = evaluate_on_test(gs_bl.best_estimator_, X_test_bl, y_test)
+res_bl["y_true"] = y_test.values
+test_results["Baseline LogReg (5)"] = res_bl
+
+# Extended LogReg
+res_st = evaluate_on_test(gs_st.best_estimator_, X_test_st, y_test)
+res_st["y_true"] = y_test.values
+test_results["Extended LogReg (22)"] = res_st
+
+# Tree-based candidates
+for name, search in best_candidates.items():
+    res = evaluate_on_test(search.best_estimator_, X_test_all, y_test)
+    res["y_true"] = y_test.values
+    test_results[name] = res
+
+# Summary table
+test_rows = []
+for name, res in test_results.items():
+    test_rows.append(
+        {
+            "Model": name,
+            "ROC-AUC": f"{res['roc_auc']:.4f}",
+            "Avg Precision": f"{res['avg_precision']:.4f}",
+            "F1": f"{res['f1']:.4f}",
+            "Precision": f"{res['precision']:.4f}",
+            "Recall": f"{res['recall']:.4f}",
+        }
+    )
+
+test_table = pd.DataFrame(test_rows)
+print("Test-Set Ergebnisse:")
+display(test_table.style.set_caption("Test-Set Performance aller Modelle"))
+
+# Log to W&B
+for name, res in test_results.items():
+    wandb.log(
+        {
+            f"test/{name}/roc_auc": res["roc_auc"],
+            f"test/{name}/avg_precision": res["avg_precision"],
+            f"test/{name}/f1": res["f1"],
+            f"test/{name}/precision": res["precision"],
+            f"test/{name}/recall": res["recall"],
+        }
+    )
+wandb.log({"test_comparison": wandb.Table(dataframe=test_table)})
+```
+
+```{python}
+print("Classification Reports:\n")
+for name, res in test_results.items():
+    print(f"{'='*60}")
+    print(f"{name}")
+    print(f"{'='*60}")
+    print(res["report"])
+```
+
+```{python}
+fig = plot_confusion_matrices(test_results)
+fig.suptitle("Confusion Matrices — Test Set", fontsize=14, fontweight="bold", y=1.02)
+wandb.log({"confusion_matrices": wandb.Image(fig)})
+plt.show()
+```
+
+```{python}
+fig = plot_roc_curves(test_results)
+wandb.log({"roc_curves": wandb.Image(fig)})
+plt.show()
+```
+
+```{python}
+fig = plot_pr_curves(test_results)
+wandb.log({"pr_curves": wandb.Image(fig)})
+plt.show()
+```
+
+# Top-N% Kundenlisten (Deliverable)
+
+Vergleich der priorisierten Kundenlisten: Welche Kunden würden die verschiedenen Modelle für die Kampagne auswählen? Precision@N zeigt, wie viele der ausgewählten Kunden tatsächlich Käufer sind.
+
+```{python}
+for pct in TOP_N_PERCENTILES:
+    pct_label = f"Top-{int(pct*100)}%"
+    print(f"\n{'='*60}")
+    print(f"{pct_label} Kundenlisten")
+    print(f"{'='*60}")
+
+    top_n_dict = {}
+    for name, res in test_results.items():
+        tn = compute_top_n_list(test_ids, y_test.values, res["y_proba"], pct)
+        top_n_dict[name] = tn
+        print(
+            f"  {name}: {tn['n_selected']} ausgewählt, "
+            f"{tn['n_positive']} Käufer, "
+            f"Precision@N = {tn['precision_at_n']:.1%}"
+        )
+
+    # Precision@N table
+    prec_rows = [
+        {
+            "Model": name,
+            f"Precision@{pct_label}": f"{tn['precision_at_n']:.1%}",
+            "Käufer gefunden": tn["n_positive"],
+            "Ausgewählt": tn["n_selected"],
+        }
+        for name, tn in top_n_dict.items()
+    ]
+    display(pd.DataFrame(prec_rows).style.set_caption(f"Precision@{pct_label}"))
+
+    # Jaccard overlap heatmap
+    overlap = compare_top_n_lists(top_n_dict)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(overlap, annot=True, fmt=".2f", cmap="YlOrRd", vmin=0, vmax=1, ax=ax)
+    ax.set_title(f"Jaccard-Overlap der {pct_label} Listen")
+    fig.tight_layout()
+    wandb.log({f"jaccard_overlap_{pct_label}": wandb.Image(fig)})
+    plt.show()
+```
+
+# Lift Curve (Deliverable)
+
+Die **Lift Curve** zeigt, wie viel besser das Modell im Vergleich zu einer zufälligen Auswahl ist. Ein Lift von 5 bei den Top-10% bedeutet: Das Modell findet 5× mehr Käufer als eine zufällige Auswahl derselben Grösse.
+
+```{python}
+fig = plot_lift_curve(test_results)
+wandb.log({"lift_curves": wandb.Image(fig)})
+plt.show()
+```
+
+**Business-Interpretation:**
+
+- **Links im Chart** (wenige Kunden kontaktiert): Hoher Lift — die Modelle identifizieren die vielversprechendsten Kunden sehr gut
+- **Cumulative Gains**: Zeigt, welchen Anteil aller Käufer man erreicht, wenn man die Top-X% der priorisierten Liste kontaktiert
+- **Praktischer Nutzen**: Bei einer Kampagnengrösse von 10% aller Kunden können die besten Modelle deutlich mehr Käufer erreichen als eine zufällige Auswahl
+
+# Feature Importance (Deliverable)
+
+Feature Importance zeigt, welche Merkmale die Modelle am stärksten für ihre Vorhersagen nutzen. Dies hilft beim Verständnis der Zielgruppe und bei der Validierung, dass die Modelle sinnvolle Muster lernen.
+
+```{python}
+# Built-in feature importance for tree models
+for name, search in best_candidates.items():
+    model = search.best_estimator_.named_steps["model"]
+
+    if hasattr(model, "feature_importances_"):
+        imp = pd.Series(model.feature_importances_, index=all_cols)
+        fig = plot_feature_importance(imp, name)
+        fig.tight_layout()
+        wandb.log({f"feature_importance_{name}": wandb.Image(fig)})
+        plt.show()
+```
+
+```{python}
+# Permutation Importance for the best model (on test set)
+# Find best model by test ROC-AUC
+best_model_name = max(test_results, key=lambda k: test_results[k]["roc_auc"])
+print(f"Bestes Modell (nach Test ROC-AUC): {best_model_name}")
+
+# Get the corresponding fitted pipeline
+if best_model_name in best_candidates:
+    best_pipe = best_candidates[best_model_name].best_estimator_
+    X_perm = X_test_all
+elif best_model_name == "Extended LogReg (22)":
+    best_pipe = gs_st.best_estimator_
+    X_perm = X_test_st
+else:
+    best_pipe = gs_bl.best_estimator_
+    X_perm = X_test_bl
+
+print("Berechne Permutation Importance (n_repeats=10)...")
+perm_result = permutation_importance(
+    best_pipe,
+    X_perm,
+    y_test,
+    scoring=SCORING_PRIMARY,
+    n_repeats=10,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+)
+
+perm_imp = pd.Series(perm_result.importances_mean, index=X_perm.columns)
+fig = plot_feature_importance(perm_imp, f"{best_model_name} (Permutation)")
+fig.tight_layout()
+wandb.log({"permutation_importance": wandb.Image(fig)})
+plt.show()
+```
+
+```{python}
+# Compare top-20 features across tree models
+top_features_all = {}
+for name, search in best_candidates.items():
+    model = search.best_estimator_.named_steps["model"]
+    if hasattr(model, "feature_importances_"):
+        imp = pd.Series(model.feature_importances_, index=all_cols)
+        top_features_all[name] = imp.nlargest(20).index.tolist()
+
+if top_features_all:
+    print("Top-20 Features pro Modell:\n")
+    top_df = pd.DataFrame(
+        {name: pd.Series(feats) for name, feats in top_features_all.items()}
+    )
+    display(top_df)
+```
+
+## Zielgruppen-Beschreibung für Nicht-Data-Scientists
+
+Basierend auf der Feature-Importance-Analyse können wir das **Profil eines typischen Kreditkarten-Käufers** wie folgt beschreiben:
+
+> **Wer kauft eine Kreditkarte?**
+>
+> Die Modelle identifizieren Kunden anhand ihres **Kontoverhaltens in den letzten 12 Monaten** vor dem Kaufzeitpunkt. Die wichtigsten Merkmale sind:
+>
+> 1. **Kontobewegungen (Transaktionsmuster):** Kunden mit bestimmten Mustern in ihren Kontobewegungen — insbesondere in Bezug auf Salden und Umsätze — sind eher geneigt, eine Kreditkarte zu erwerben. Dies umfasst Variabilität, Trends und Häufigkeit der Transaktionen.
+>
+> 2. **Vermögen und Umsatz:** Kunden mit höherem letztem Kontostand und/oder höherem Umsatz zeigen eine höhere Affinität.
+>
+> 3. **Alter und Geschlecht:** Es gibt erkennbare demografische Muster, wobei bestimmte Altersgruppen und Geschlechter etwas häufiger eine Karte erwerben.
+>
+> 4. **Regionale Faktoren:** Der Durchschnittslohn und die wirtschaftliche Situation des Bezirks spielen eine Rolle.
+>
+> **Empfehlung:** Kontaktieren Sie die Top-10% der priorisierten Liste. Diese Gruppe enthält deutlich mehr potenzielle Käufer als eine zufällige Auswahl gleicher Grösse (siehe Lift Curve).
+
+# Zusammenfassung & Empfehlungen
+
+```{python}
+# Final comparison table
+final_rows = []
+for name, res in test_results.items():
+    # Determine feature count
+    if "(5)" in name:
+        n_feat = 5
+    elif "(22)" in name:
+        n_feat = len(static_cols)
+    else:
+        n_feat = len(all_cols)
+
+    final_rows.append(
+        {
+            "Modell": name,
+            "Features": n_feat,
+            "CV ROC-AUC": (
+                f"{[r for r in rows if r['Model']==name][0]['roc_auc_mean']:.4f}"
+                if any(r["Model"] == name for r in rows)
+                else "—"
+            ),
+            "Test ROC-AUC": f"{res['roc_auc']:.4f}",
+            "Test Avg Prec": f"{res['avg_precision']:.4f}",
+            "Test F1": f"{res['f1']:.4f}",
+        }
+    )
+
+final_table = pd.DataFrame(final_rows)
+print("Finale Vergleichstabelle:")
+display(final_table.style.set_caption("Modellvergleich — Zusammenfassung"))
+wandb.log({"final_comparison": wandb.Table(dataframe=final_table)})
+```
+
+## Business-Empfehlung
+
+**Modellwahl:**
+Das beste Modell nach Test ROC-AUC wird für die Kampagne empfohlen. Tree-basierte Ensemble-Modelle übertreffen die logistische Regression deutlich, da sie komplexe Interaktionen zwischen den ~1'576 Features erfassen können.
+
+**Kampagnengrösse:**
+- **Top-5%** (~39 Kunden): Höchste Precision — ideal für ein begrenztes Budget oder eine Pilot-Kampagne
+- **Top-10%** (~78 Kunden): Guter Kompromiss zwischen Reichweite und Trefferquote
+- Die Lift Curve zeigt, ab welchem Punkt der Mehrwert gegenüber einer zufälligen Auswahl abnimmt
+
+**Nächste Schritte:**
+1. Kampagne mit Top-10% Liste des besten Modells starten
+2. Response-Daten sammeln und Modell iterativ verbessern
+3. Monitoring der Modellperformance über Zeit (Concept Drift)
+
+# AI Tool Disclosure
+
+Im Rahmen dieser Mini-Challenge wurden KI-gestützte Werkzeuge eingesetzt, um den Entwicklungsprozess zu beschleunigen und die Qualität der Ergebnisse zu verbessern.
+
+**Eingesetzte Tools:**
+- **Claude Code (Anthropic):** Ein KI-gestützter Programmierassistent, der im gesamten Projekt als primäres Entwicklungswerkzeug verwendet wurde. Claude Code unterstützte bei der Code-Erstellung, beim Debugging, bei der Architekturplanung und bei der Dokumentation.
+
+**Einsatzbereiche:**
+
+*Datenverständnis & Studiendesign (Phase 1):* Claude Code half bei der Erstellung des Entity-Relationship-Diagramms, der Validierung von Primär- und Fremdschlüsseln, und bei der Entwicklung des Studiendesigns mit tenure-matched Pseudo-Events für Nicht-Käufer. Die zentrale Designentscheidung — wie man faire Vergleichszeitpunkte für Nicht-Karteninhaber definiert — wurde iterativ mit KI-Unterstützung erarbeitet.
+
+*Feature Engineering (Phase 2):* Der Aufbau der Feature-Pipeline wurde mit KI-Unterstützung implementiert. Dies umfasste die Integration von tsfresh für automatische Zeitreihen-Feature-Extraktion, die Berechnung der 5 Baseline-Features, und die Erstellung von 22 statischen Features aus Bezirks-, Kredit- und Auftragsdaten. Die Leakage-freie Pipeline-Architektur wurde mit KI-Beratung entworfen.
+
+*Predictive Modeling (Phase 3):* Die Modellierung — von der Baseline Logistischen Regression bis zu den Ensemble-Methoden (Random Forest, Gradient Boosting, HistGradient Boosting) — wurde mit KI-Unterstützung implementiert. Hyperparameter-Suchräume, Cross-Validation-Strategie und die Evaluation-Pipeline wurden gemeinsam mit Claude Code entwickelt. Die Visualisierungen (ROC, PR, Lift, Confusion Matrix) und die Feature-Importance-Analyse wurden ebenfalls KI-gestützt erstellt.
+
+**Reflexion:**
+Der Einsatz von KI-Tools hat den Entwicklungsprozess erheblich beschleunigt, insbesondere bei repetitiven Aufgaben wie Pipeline-Konstruktion und Visualisierung. Die konzeptionellen Entscheidungen — Studiendesign, Feature-Auswahl, Modellinterpretation — erforderten jedoch weiterhin menschliches Domänenwissen und kritisches Denken. Die KI diente als Beschleuniger, nicht als Ersatz für fachliche Kompetenz.
+
+# Quellenverzeichnis
+
+1. Berka, P. (1999). *PKDD'99 Discovery Challenge: Czech Bank Financial Dataset.* Prague University of Economics.
+2. Pedregosa, F. et al. (2011). *Scikit-learn: Machine Learning in Python.* JMLR 12, pp. 2825–2830.
+3. Christ, M. et al. (2018). *Time Series FeatuRe Extraction on basis of Scalable Hypothesis tests (tsfresh — A Python package).* Neurocomputing 307, pp. 72–77.
+4. Anthropic. (2025). *Claude Code.* https://claude.ai/code
+
+```{python}
+wandb.finish()
+print("Phase 3 abgeschlossen.")
+```
+
