@@ -42,7 +42,7 @@ from src.features import (
 
 RANDOM_STATE = 42
 CV_FOLDS = 5
-N_ITER_RANDOM_SEARCH = 30
+N_ITER_RANDOM_SEARCH = 60
 SCORING_PRIMARY = "roc_auc"
 SCORING_METRICS = ["roc_auc", "average_precision", "f1", "precision", "recall"]
 TOP_N_PERCENTILES = [0.05, 0.10]
@@ -384,3 +384,48 @@ def plot_confusion_matrices(results: dict[str, dict]) -> plt.Figure:
 
     fig.tight_layout()
     return fig
+
+
+# ── Hyperparameter Boundary Check ───────────────────────────────────────────
+
+
+def check_param_at_boundary(
+    best_params: dict,
+    param_grid: dict,
+) -> list[str]:
+    """
+    Warn if any best parameter lies at the edge of its list-valued numeric grid.
+
+    Only numeric grids are checked: a grid like ["sqrt", "log2", 0.1, 0.3] mixes
+    categorical and numeric values, so "edge" is not well-defined and the grid
+    is skipped. None entries are ignored (they typically mean "no limit").
+
+    Returns a list of warning strings (empty if no boundary hits).
+    """
+    warnings = []
+    for k, v in best_params.items():
+        grid_vals = param_grid.get(k)
+        if not isinstance(grid_vals, list) or len(grid_vals) < 2:
+            continue
+
+        non_none = [x for x in grid_vals if x is not None]
+        # Skip grids with any non-numeric entry (booleans are excluded too)
+        if not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in non_none
+        ):
+            continue
+        if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue
+
+        numeric_vals = sorted(non_none)
+        if len(numeric_vals) < 2:
+            continue
+        if v == numeric_vals[0]:
+            warnings.append(
+                f"⚠ {k}={v} liegt am unteren Rand der Grid {grid_vals} — Range erweitern empfohlen"
+            )
+        elif v == numeric_vals[-1]:
+            warnings.append(
+                f"⚠ {k}={v} liegt am oberen Rand der Grid {grid_vals} — Range erweitern empfohlen"
+            )
+    return warnings

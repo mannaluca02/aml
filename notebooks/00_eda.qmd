@@ -12,15 +12,6 @@ lang: de
 jupyter: python3
 ---
 
-# Improvements:
-
-Folgende Punkte können in dem Notebook angepasst werden:
-haben. 
-- **Info:** Aktuell fehlen noch die Informationen ob ein Attribut unique ist und ob es optional ist oder nicht. 
-- Quellenverzeichniss bauen
-
-# Importe
-
 ```{python}
 import sys
 import os
@@ -60,7 +51,7 @@ PATH_RAW_TRANS = PATH_RAW + "trans.csv"
 ROLLUP_MONTHS = 12
 LAG_MONTHS = 1
 TOTAL_HISTORY_MONTHS = ROLLUP_MONTHS + LAG_MONTHS  # 13
-JUNIOR_AGE_CUTOFF = 21  # max junior card holder age ≈ 20.89
+JUNIOR_AGE_CUTOFF = 21  # max junior card holder age ≈ 20.89, derivation later in EDA
 
 # Data Splits
 TRAIN_RATIO = 0.8
@@ -221,23 +212,29 @@ cardinality_df.style.set_properties(**{"text-align": "left"})
 - Keine Orphans und keine FK-Nulls -> referentielle Integrität ist vollständig gegeben
 - **disp** ist die zentrale Brücken-Tabelle zwischen Client und Account
 
-| Relation | Kardinalität |
-|---|---|
-| district -> account | 1:N (32–554) |
-| district -> client | 1:N (43–663) |
-| client -> disp | 1:1 |
-| account -> disp | 1:N (max 2) |
-| disp -> card | 1:1 (optional, 892/5369) |
-| account -> loan | 1:1 (optional, 682/4500) |
-| account -> order | 1:N (max 5) |
-| account -> trans | 1:N (max 675) |
+| Linke Seite | Beziehung | Rechte Seite |
+|---|---|---|
+| district (1,1) | — (1,N) | account |
+| district (1,1) | — (1,N) | client |
+| client (1,1) | — (1,1) | disp |
+| account (1,1) | — (1,2) | disp |
+| disp (1,1) | — (0,1) | card |
+| account (1,1) | — (0,1) | loan |
+| account (1,1) | — (0,N) | order |
+| account (1,1) | — (1,N) | trans |
 
+Notation `(min,max)`:
+- `(0,1)` bedeutet optional bis zu einem zugeordneten Element. 
+- `(1,N)` heisst mindestens ein Eintrag, ohne obere Schranke.
+- `(1,2)` ist eine harte Obergrenze von zwei (z.B. OWNER + optionaler DISPONENT pro Konto).
 
-> Da `card.disp_id` als PK der Card-Tabelle verwendet wird und gleichzeitig FK auf disp ist, ist die Beziehung disp -> card tatsächlich **1:0..1** (optional 1:1).
+> Der PK der Card-Tabelle ist `card.card_id` (siehe PK-Check oben). Die Spalte `card.disp_id` ist ein FK auf `disp.disp_id` mit einem **Unique-Constraint** (jede Disposition kann höchstens eine Karte haben). Daraus folgt die Beziehung disp -> card als **1:0..1** (optional 1:1).
 
 ## ERD
 
 Das ERD wurde basierend auf den vorherigen Analysen erstellt. 
+
+> TODO: In dem ERD muss in der card Tabelle noch der PK geändert werden von disp_id zu card_id
 
 ![title](../erd/aml.png)
 
@@ -277,6 +274,8 @@ print("=== DESCRIBE: district (demografische Kennzahlen) ===")
 print(district.describe().round(1).to_string())
 ```
 
+### ErkenntnisseDie Transaktionstabelle (`trans`) dominiert mit 1.06 Mio. Zeilen und 100.5 MB den Datensatz bei weitem. Alle anderen Tabellen zusammen belegen weniger als 1 MB. Sie ist damit die primäre Datenquelle für das spätere Feature Engineering.Mehrere Datumsspalten (`account.date`, `loan.date`, `trans.date`) liegen noch im Format YYMMDD als Integer vor und werden im nächsten Schritt in `datetime` konvertiert. Das Feld `card.issued` ist als String gespeichert und enthält teils angehängte Stunden.Die `district`-Tabelle enthält kryptische Spaltennamen (A1 bis A16). Die für das Modell relevanten Felder sind Durchschnittsgehalt (A11: 8110 bis 12541 CZK), Arbeitslosenquote (A13: 0.4% bis 9.4%) und Urbanisierungsgrad (A10: 33.9% bis 100%). Die starke Streuung der Einwohnerzahl (A4: 42821 bis 1204953) zeigt den Grössenunterschied zwischen Prag und ländlichen Bezirken.Zwei Auffälligkeiten aus `trans.describe()`:* Kontostände können negativ werden (Minimum: 41125 CZK im Minus), d.h. Überziehungskredite sind im Datensatz vorhanden.* Transaktionsbeträge sind stark rechtsschief (Median 2100 CZK gegenüber Mittelwert 5924 CZK), was auf vereinzelte sehr grosse Transaktionen hindeutet.Kreditlaufzeiten in `loan` bewegen sich zwischen 12 und 60 Monaten, Kreditbeträge zwischen 4980 und 590820 CZK.
+
 # Datenqualität und vorbereitende Exploration
 
 ## Datenqualität pro Tabelle
@@ -296,6 +295,8 @@ for name, df in dataframes.items():
         print("  Keine fehlenden Werte.")
     print("-" * 40)
 ```
+
+### Erkenntnisse7 von 8 Tabellen weisen weder Duplikate noch fehlende Werte auf. Die Datenqualität ist damit insgesamt hoch.Einzige Ausnahme ist `trans` mit vier betroffenen Spalten: `operation` (183114 NaN, ca. 17%), `k_symbol` (481881 NaN, ca. 46%), `bank` (782812 NaN, ca. 74%) und `account` (760931 NaN, ca. 72%). Die hohen Anteile deuten auf strukturell bedingte Lücken hin und nicht auf zufällige Datenfehler. Die detaillierte Analyse folgt im nächsten Abschnitt.
 
 ### Analyse fehlender Werte in `trans`
 Die Tabelle `trans` ist die einzige mit fehlenden Werten. Vier Spalten sind betroffen: `operation` (17%), `k_symbol` (46%), `bank` (74%) und `account` (72%). Bevor wir diese Werte im Feature Engineering behandeln, müssen wir verstehen, ob es sich um **strukturelle** (systembedingte) oder **zufällige** Lücken handelt. Dazu analysieren wir die Verteilung der NaNs in Abhängigkeit vom Transaktionstyp (`type`) und der Transaktionsart (`operation`).
@@ -499,6 +500,8 @@ print(
 )
 ```
 
+### Erkenntnisse92.6% der Konten (4167 von 4500) verwenden den monatlichen Kontoauszug. Wöchentliche (240) und transaktionsbasierte (93) Auszüge sind selten. Die Kontoauszugs-Frequenz ist ein explizit gefordertes Baseline-Feature und fliesst als Indikatorvariable ins Modell ein.Die monatlichen Kontoeröffnungen zeigen ein klares Wachstumsmuster: von 1993 bis Mitte 1996 nimmt die Neukunden-Akquisition deutlich zu und erreicht ein Maximum von rund 135 neuen Konten pro Monat. Ab Ende 1996 flacht das Wachstum ab. Das letzte Konto wurde am 1997-12-29 eröffnet, d.h. 1998 gibt es keine neuen Konten im Datensatz. Dieser Wachstumsverlauf ist später relevant für die Interpretation der Kalenderzeit-Verteilung der Karten-Events.
+
 ## Exploration der Kundendaten (client)
 
 Die `client` Tabelle enthält Alter und Geschlecht (bereits aus `birth_number` extrahiert). Für das Baseline-Modell sind "Alter" und "Geschlecht" explizit geforderte Features. Wir untersuchen deren Verteilungen.
@@ -540,6 +543,8 @@ print("Altersstatistik:")
 print(client["age"].describe().round(1))
 print(f"\nGeschlechterverteilung:\n{gender_counts}")
 ```
+
+### ErkenntnisseDas Alter ist relativ zum Ende der Transaktionshistorie (Ende 1998) berechnet. Die Verteilung erstreckt sich von 11 bis 87 Jahre (Median 44, Mittelwert 44.8). Das Minimum von 11 Jahren zeigt, dass Minderjährige im Datensatz vorhanden sind. Diese Gruppe ist für das Kreditkartenmodell nicht relevant und wird im Studiendesign über den Alters-Cutoff von 21 Jahren ausgeschlossen.Die Altersverteilung ist im Bereich 20 bis 60 Jahre annähernd gleichmässig, mit einem leichten Häufigkeitsabfall nach dem 60. Lebensjahr.Die Geschlechterverteilung ist nahezu ausgeglichen (M: 2724, F: 2645). Ein systematischer Gender-Bias in der Kundenbasis ist nicht vorhanden. Beide Merkmale sind explizit geforderte Baseline-Features für das Modell.
 
 ## Exploration der Dispositionsdaten (disp)
 
@@ -649,6 +654,8 @@ print("Top-10 Bezirke nach Anzahl Konten:")
 print(accounts_per_district.head(10).to_string())
 ```
 
+### ErkenntnissePrag (district_id 1) dominiert die Kontoverteilung mit 554 Konten und ist damit mehr als dreimal so gross wie der zweitgrösste Bezirk (district_id 70 mit 152). Prag ist auch der Ausreisser im Durchschnittsgehalt (~12500 CZK gegenüber dem Median von 8814 CZK aller Bezirke).Das Durchschnittsgehalt (A11) ist rechtsschief verteilt. Die grosse Mehrheit der Bezirke liegt zwischen 8000 und 9500 CZK. Die Arbeitslosenquote (A13) ist ebenfalls rechtsschief mit einem Median von ca. 3.6%.Aus der Korrelationsmatrix sind zwei Zusammenhänge relevant für das Feature Engineering: Urbanisierungsgrad und Durchschnittsgehalt korrelieren moderat positiv (0.60), d.h. städtischere Bezirke haben tendenziell höhere Löhne. Unternehmerdichte und Arbeitslosenquote korrelieren negativ (0.51), was ökonomisch plausibel ist. Diese Kollinearität ist beim Einsatz beider Features im Modell zu beachten.
+
 ## Exploration der Transaktionsdaten (trans)
 
 Die `trans` Tabelle ist mit über 1 Mio. Einträgen die grösste und wichtigste Datenquelle für das Feature Engineering. Transaktionsmuster vor dem Kreditkartenkauf bilden die Grundlage des Rollup-Zeitfensters. Wir analysieren die zeitliche Verteilung, Transaktionstypen und -volumina, Verwendungszwecke sowie die Saldenentwicklung.
@@ -707,6 +714,8 @@ print("Verteilung der Operationsmodi:")
 print(trans["operation"].value_counts(dropna=False).to_string())
 ```
 
+### ErkenntnisseDas monatliche Transaktionsvolumen wächst von 1993 bis Ende 1998 kontinuierlich, was das Kontowachstum der Bank widerspiegelt. Auffällig sind wiederkehrende Spikes jeweils zu Jahresbeginn (Januar 1994, 1995, 1996, 1997, 1998), wobei der Spike Anfang 1998 mit rund 43000 Transaktionen besonders ausgeprägt ist. Das Muster ist systematisch: Jahresbeginn-Spikes entstehen durch gebündelte Zinsgutschriften, die Banken typischerweise einmal jährlich zu Jahresbeginn als Systemtransaktionen buchen. Dies deckt sich mit dem k_symbol-Plot, in dem `interest_credited` die häufigste Kategorie ist, sowie mit dem Befund, dass diese Buchungen NaN als Operationsfeld aufweisen.Wie erwartet überwiegen Auszahlungen (withdrawal: 634571, 60%) gegenüber Gutschriften (credit: 405083, 38%). Konten werden primär zum Ausgeben genutzt.Bei den Operationsmodi dominiert `withdrawal_in_cash` mit 435000 Einträgen (41%). Die 183114 NaN-Einträge entsprechen Systemtransaktionen ohne explizite Kundenoperation (z.B. Zinsgutschriften) und wurden bereits als strukturelle NaNs identifiziert. `credit_card_withdrawal` ist mit 8036 Einträgen (0.8%) sehr selten und signalisiert bereits existierende Kreditkartennutzung in der Kundenbasis.Die Betragsverteilung ist auf der log-Skala bimodal: ein schmaler Spike bei sehr kleinen Beträgen (ca. 10 bis 20 CZK, vermutlich Zinsbuchungen) und die Hauptmasse zwischen 100 und 100000 CZK. Grosse Einzelbeträge bis 87400 CZK kommen vor, sind aber selten.
+
 ## Exploration der Kreditdaten (loan)
 
 Die `loan` Tabelle beschreibt vergebene Kredite. Ob ein Kunde bereits einen Kredit hat, ist ein potenzielles Feature für das Affinitätsmodell. Wir untersuchen Kreditbeträge, Laufzeiten, Vertragsstatus und die zeitliche Verteilung der Kreditvergaben.
@@ -759,6 +768,8 @@ print(f"Anzahl Kredite total: {len(loan)}")
 print(f"\nStatusverteilung:\n{status_counts}")
 ```
 
+### ErkenntnisseNur 682 von 4500 Konten (15.2%) haben überhaupt einen Kredit. Kreditvergaben beginnen erst ab 1994 und nehmen bis 1998 zu, was wiederum das allgemeine Kundenwachstum widerspiegelt.Die Laufzeiten sind auf fünf diskrete Werte standardisiert (12, 24, 36, 48, 60 Monate) und gleichmässig verteilt. Die 60-Monats-Laufzeit ist mit 144 Krediten leicht am häufigsten.Der Grossteil der Kredite ist in Ordnung: Status C (laufend OK) macht 59% aus, Status A (abgeschlossen OK) weitere 30%. Die kombinierte Ausfallrate aus Status B (abgeschlossen, unbezahlt) und D (laufend, in Schulden) liegt bei rund 11%.Aus dem Boxplot ist erkennbar, dass laufende Kredite mit Problemen (Status D) im Median deutlich höhere Beträge aufweisen als abgeschlossene Kredite. Ob ein Konto einen Kredit hat sowie die Kredithöhe und monatliche Rate sind Features für das Affinitätsmodell.
+
 ## Exploration der Dauerauftragsdaten (order)
 
 Die `order` Tabelle enthält Daueraufträge (nur Belastungen). Regelmässige Zahlungen wie Versicherungen, Haushalt oder Leasing können Indikatoren für finanzielle Stabilität sein. Wir analysieren die Verteilung der Zahlungszwecke und -beträge.
@@ -799,6 +810,8 @@ plt.show()
 print("Deskriptive Statistik der Dauerauftragsbeträge:")
 print(order["amount"].describe().round(1))
 ```
+
+### Erkenntnisse`household_payment` dominiert mit 3502 Einträgen (54%) klar. Die zweithäufigste Kategorie (1379 Einträge) ist im Plot nicht beschriftet, entspricht aber `payment_for_statement`. Insgesamt decken die fünf Kategorien household_payment, payment_for_statement, loan_payment (717), insurance_payment (532) und leasing (341) alle 6471 Daueraufträge ab.Die Betragsverteilung variiert je nach Zweck: Kreditraten-Daueraufträge haben den höchsten Median (~4000 CZK), während Versicherungszahlungen tiefer liegen (~1500 CZK). Alle Kategorien weisen Ausreisser nach oben auf. Der Gesamtbereich ist 1 bis 14882 CZK bei einem Median von 2596 CZK.Für das Modell relevant sind das Vorhandensein bestimmter Dauerauftragstypen als binäre Features (`has_household_order`, `has_loan_order`, `has_insurance_order`) sowie die Anzahl und Gesamtsumme aller Daueraufträge als Indikatoren für finanzielle Verpflichtungen.
 
 ## Zielgruppen-Definition: Kreditkarten-Käufer (Target = 1)
 
@@ -862,6 +875,8 @@ axes[2].tick_params(axis="x", rotation=45)
 plt.tight_layout()
 plt.show()
 ```
+
+### ErkenntnisseVon 892 Karten total sind 145 Junior-Karten (16.2%), die gemäss Aufgabenstellung aus der Zielgruppe ausgeschlossen werden. Die verbleibenden 747 Karten (classic: 659, gold: 88) bilden die Positivklasse (Target = 1).Die Kartenausstellungen konzentrieren sich stark auf die Jahre 1997 bis 1999. Vor 1996 wurden kaum Karten vergeben. Diese zeitliche Konzentration erklärt, warum die Käufer-Gruppe im Studiendesign eine spezifische Kalenderzeit-Verteilung aufweist und ist der Hauptgrund dafür, dass das Tenure-Matching gegenüber einem reinen Kalenderzeit-Ansatz bevorzugt wird.Gold-Karten sind selten (88, entspricht 11.8% der gültigen Karten) und treten erst ab 1996/97 regelmässig auf. Classic-Karten wachsen ab 1997 stark und erreichen Ende 1998 einen Peak von rund 40 Ausstellungen pro Monat.
 
 ## Exemplarische Kontoanalyse: Vermögen & Umsatz (Konten 14 und 18)
 
@@ -935,6 +950,8 @@ plt.tight_layout()
 plt.show()
 ```
 
+### ErkenntnisseDie beiden Konten zeigen grundlegend unterschiedliche Verhaltensmuster. Konto 18 ist hochvolatil mit unregelmässigen Umsatzspikes von bis zu 300000 CZK pro Monat und entsprechend starken Schwankungen im Saldo (Bereich ca. 1000 bis 107000 CZK). Konto 14 erscheint erst ab 1997 (spätere Kontoeröffnung), hat einen moderaten und gleichmässigeren Umsatz unter 50000 CZK pro Monat und einen stabilen Saldo im Bereich 25000 bis 45000 CZK.Diese Beispiele verdeutlichen die Notwendigkeit von Rollup-Features: Der letzte Kontostand (`balance_last`) und der Gesamtumsatz (`turnover`) über ein 12-Monats-Fenster aggregieren diese volatilen Zeitreihen zu einer einzelnen Zahl pro Konto. Statistische Kennzahlen wie Standardabweichung, Median und Trend ergänzen dabei das Bild und sind robuster gegenüber einzelnen Ausreissern.
+
 ## Zeitliche Analyse: Kontoeröffnung bis Kartenkauf
 
 Um eine faire Strategie für die Zuweisung von Vergleichszeitpunkten an Nicht-Kartenbesitzer zu entwickeln, untersuchen wir zunächst, wie viele Monate nach Kontoeröffnung typischerweise eine Kreditkarte ausgestellt wird. Diese Verteilung bildet die Grundlage für die spätere Pseudo-Event-Zuweisung im Studiendesign.
@@ -979,6 +996,8 @@ plt.show()
 print("Zusammenfassende Statistiken (Monate bis zum Kartenkauf):")
 print(card_account_map["months_to_card"].describe().round(1))
 ```
+
+### ErkenntnisseDie Verteilung ist rechtsschief: Die Mehrheit der Kartenausstellungen erfolgt innerhalb der ersten 2 Jahre nach Kontoeröffnung, mit einem Median von 22 Monaten und einem Modus um 20 Monate. Ein langer rechter Schwanz erstreckt sich bis 71 Monate.Das Minimum von 6 Monaten zeigt, dass einzelne Karten sehr früh ausgestellt wurden. Der 25%-Quantil liegt bei 13 Monaten, was dem Mindest-Rollup-Constraint (12M Rollup + 1M Lag = 13M) entspricht. Karten, die innerhalb der ersten 13 Monate ausgestellt wurden, können kein vollständiges Rollup-Fenster vorweisen und werden im Studiendesign ausgeschlossen.Diese Verteilung bildet die empirische Grundlage für die Pseudo-Event-Zuweisung an Nicht-Kartenbesitzer. Sie wird ausschliesslich aus Train-Card-Holders berechnet, um Data Leakage zu verhindern.
 
 ## Erster Vergleich: Kartenbesitzer vs. Nicht-Kartenbesitzer
 
@@ -1133,6 +1152,8 @@ comparison.index = ["Kein Card (0)", "Card Holder (1)"]
 print(comparison.to_string())
 ```
 
+### ErkenntnisseDie Zielvariable ist moderat unbalanciert: 13.9% Kartenbesitzer (747) gegenüber 86.1% Nicht-Kartenbesitzer (4622). Dieser Vergleich erfolgt noch vor dem Rollup-Filter und ohne Studiendesign-Bereinigung.Die Unterschiede zwischen den Gruppen auf den Baseline-Features sind insgesamt gering:* **Alter:** Kartenbesitzer sind im Schnitt etwas jünger (Mittelwert 43.0 vs. 45.1 Jahre). Der Unterschied ist statistisch vorhanden, aber klein.* **Geschlecht:** Kartenbesitzer sind leicht häufiger männlich (53% vs. 50%). Kein starkes Signal.* **Durchschnittsgehalt:** Marginaler Unterschied (9605 vs. 9496 CZK). Beide Gruppen ähnlich verteilt.* **Kredit vorhanden:** Der deutlichste Unterschied: 20% der Kartenbesitzer haben einen Kredit gegenüber 15% der Nicht-Kartenbesitzer. Kartenbesitzer nutzen tendenziell mehr Finanzprodukte.* **Kontoauszugs-Frequenz:** Nahezu identisch in beiden Gruppen, kein Signal.Die schwache Trennung auf den Basis-Features zeigt, dass diese allein nicht ausreichen für ein starkes Modell. Transaktionsbasierte Behavioral-Features aus dem Rollup-Fenster werden für die eigentliche Trennleistung entscheidend sein.
+
 ```{python}
 # === Studiendesign: Konstanten ===
 # (Definiert in den globalen Konstanten am Anfang des Notebooks)
@@ -1152,12 +1173,86 @@ Kartenbesitzer haben ein natürliches Ereignisdatum: den Tag der Kartenausstellu
 Aus der pharmakoepidemiologischen Literatur zu *New-User Designs* (Pottegård 2022, Her 2024, Suissa 2008) wissen wir, dass der **Zeitpunkt Null** (*Time Zero*) zwischen Behandlungs- und Kontrollgruppe synchronisiert werden muss, um faire Vergleiche zu ermöglichen. Wir übertragen dieses Prinzip auf unser Affinitätsmodell: Jeder Nicht-Kartenbesitzer erhält ein **Pseudo-Ereignisdatum**, das so gewählt wird, dass die Verteilung der Kontoalter zum Ereigniszeitpunkt zwischen beiden Gruppen vergleichbar ist.
 
 ### Ausschluss-Kriterien (vor dem Rollup)
-1. **DISPONENTen:** Nur Konto-Inhaber (OWNER) werden berücksichtigt — DISPONENTen haben keine eigene Kartenentscheidung.
-2. **Junior-Alter:** Kunden unter 21 Jahren zum Ereigniszeitpunkt werden ausgeschlossen, da Junior-Karten nicht im Angebot sind.
+1. **DISPONENTen:** Nur Konto-Inhaber (OWNER) werden berücksichtigt.
+2. **Junior-Alter:** Kunden unter 21 Jahren zum Ereigniszeitpunkt werden ausgeschlossen, da Junior-Karten nicht im Angebot sind — datenbasierte Begründung folgt im nächsten Abschnitt.
 3. **Unzureichende Historie:** Konten mit weniger als 13 Monaten Transaktionshistorie vor dem Ereignis (12 Monate Rollup + 1 Monat Lag).
 
 ### Lag-Monat
-Zwischen dem Ende des Rollup-Fensters und dem Ereignisdatum liegt ein **1-Monats-Buffer** (Lag). Dieser verhindert, dass Transaktionen aus dem Karten-Antragsmonat (z.B. erhöhte Aktivität durch den Antragsprozess) in die Features einfliessen und Target Leakage verursachen.
+Zwischen dem Ende des Rollup-Fensters und dem Ereignisdatum liegt ein **1-Monats-Buffer** (Lag). Dieser verhindert, dass Transaktionen aus dem Karten-Antragsmonat (z.B. erhöhte Aktivität durch den Antragsprozess) in die Features einfliessen und Target Leakage verursachen. Das Fenster lautet damit: `[rollup_start ... rollup_end] [1M Lag] [event_date]`.
+
+### Datenbasierte Validierung der Altersschwelle
+
+Die Eligibility-Regel "Alter >= 21" soll Junior-Karten-Kandidaten ausschliessen, da klassische/goldene Kreditkarten erst ab Volljährigkeit + Boniprüfung vergeben werden. Bevor wir den Filter anwenden, prüfen wir aus den Daten, **wie jung** echte Card-Holder zum Kaufzeitpunkt tatsächlich waren und wie viele Kunden im kritischen Altersband [18, 21) liegen.
+
+```{python}
+# === Datenbasierte Validierung der Altersschwelle (vor Eligibility-Filter) ===
+
+# Minimal-Build von owner_clients für die Validierung (analoge Logik wie unten)
+_owner_disps_val = disp[disp["type"] == "OWNER"].copy()
+_owner_clients_val = _owner_disps_val.merge(
+    client[["client_id", "birth_date"]], on="client_id", how="left"
+).merge(
+    card_account_map[["account_id", "issued"]].rename(
+        columns={"issued": "card_issued"}
+    ),
+    on="account_id",
+    how="left",
+)
+_owner_clients_val["is_card_holder"] = _owner_clients_val["account_id"].isin(
+    set(card_account_map["account_id"])
+)
+# Card-Holder: Alter bei Kartenausstellung; Non-Card: Alter zum Ende der Datenhistorie
+_owner_clients_val["event_ref_date"] = _owner_clients_val["card_issued"].fillna(
+    max_global_date
+)
+_owner_clients_val["age_at_event"] = (
+    _owner_clients_val["event_ref_date"] - _owner_clients_val["birth_date"]
+).dt.days / 365.25
+
+# 1. Jüngstes Alter zum Ereigniszeitpunkt je Gruppe
+print("=== Jüngstes Alter zum Ereigniszeitpunkt ===")
+_min_age_card = _owner_clients_val.loc[
+    _owner_clients_val["is_card_holder"], "age_at_event"
+].min()
+_min_age_non_card = _owner_clients_val.loc[
+    ~_owner_clients_val["is_card_holder"], "age_at_event"
+].min()
+print(f"  Card-Holder      : {_min_age_card:.2f} Jahre")
+print(f"  Nicht-Card-Holder: {_min_age_non_card:.2f} Jahre")
+
+# 2. Quantile des Alters zum Ereigniszeitpunkt
+print("\n=== Quantile age_at_event (Jahre) ===")
+_quantiles = [0.01, 0.05, 0.25, 0.50, 0.75, 0.95]
+_q_df = (
+    _owner_clients_val.groupby("is_card_holder")["age_at_event"]
+    .quantile(_quantiles)
+    .unstack(level=1)
+    .round(2)
+)
+_q_df.index = _q_df.index.map({True: "Card-Holder", False: "Nicht-Card-Holder"})
+_q_df.columns = [f"q{int(q * 100)}" for q in _quantiles]
+print(_q_df.to_string())
+
+# 3. Anzahl Kunden im Altersband [18, 21) und unter 18
+print("\n=== Verteilung im kritischen Altersband ===")
+_under_18 = _owner_clients_val["age_at_event"] < 18
+_band_18_21 = (_owner_clients_val["age_at_event"] >= 18) & (
+    _owner_clients_val["age_at_event"] < 21
+)
+for label, mask in [("< 18 Jahre", _under_18), ("[18, 21) Jahre", _band_18_21)]:
+    n_total = mask.sum()
+    n_card = (mask & _owner_clients_val["is_card_holder"]).sum()
+    n_non_card = (mask & ~_owner_clients_val["is_card_holder"]).sum()
+    print(
+        f"  {label:18s}: total={n_total:4d}  "
+        f"davon Card-Holder={n_card:3d}, Nicht-Card-Holder={n_non_card:4d}"
+    )
+
+# Aufräumen der temporären Variablen
+del _owner_disps_val, _owner_clients_val, _q_df
+```
+
+Der jüngste Card-Holder war 20.28 Jahre alt. Im Band [18, 21) gibt es 11 echte Card-Holder. Das sind Ausnahmen (11 von 747, ~1.5%). Die Schwelle 21 ist daher keine datenbasiert exakte Grenze, sondern eine pragmatische Abgrenzung: Sie schliesst eine Altersgruppe aus, in der Karten sehr selten vergeben wurden, und deckt sich mit dem Mindestalter für Junior-Card-Holder aus der Produktbeschreibung. "Konservativ" trifft zu, aber nicht im Sinne von "null Ausnahmen", sondern im Sinne von "auf der sicheren Seite".
 
 ```{python}
 # === Eligibility Filtering: OWNERs only, junior-age exclusion ===
@@ -1219,9 +1314,7 @@ print(f"\n  Validierung: Alle {len(valid_cards)} valid cards gehören zu OWNERs 
 
 ### Interpretation der Eligibility-Filterung
 
-- Alle 747 gültigen Karten (classic + gold) gehören zu **OWNER**-Dispositionen — der DISPONENT-Ausschluss eliminiert nur Nicht-Kartenbesitzer-Accounts mit einem zweiten Nutzer.
-- Kunden unter 21 Jahren zum Ereigniszeitpunkt werden ausgeschlossen, da Junior-Karten nicht angeboten werden und diese Altersgruppe nicht zur Zielgruppe gehört.
-- Die verbleibenden Accounts bilden die **eligible population** für das Studiendesign.
+Die Validierung bestätigt: Alle 747 gültigen Karten (classic + gold) gehören zu OWNER-Dispositionen. Die verbleibenden Accounts bilden die **eligible population** für das Studiendesign.
 
 ```{python}
 # === Studientabelle der Kartenbesitzer (mit Lag-Monat) ===
@@ -1303,9 +1396,6 @@ Um Nicht-Kartenbesitzern ein faires Pseudo-Ereignisdatum zuzuweisen, verwenden w
 
 **Warum Tenure-Matching statt Kalenderzeit?**
 Die Kartenausstellungen konzentrieren sich auf 1997–1998. Ein reines Kalenderzeit-Matching würde Nicht-Kartenbesitzern, deren Konten 1993–1994 eröffnet wurden, künstlich lange Historien zuordnen. Das Tenure-Matching stellt sicher, dass das **Kontoalter zum Ereigniszeitpunkt** zwischen beiden Gruppen verteilungsgleich ist.
-
-**Warum Lag-Monat?**
-Der 1-Monats-Buffer zwischen Rollup-Ende und Ereignisdatum (`[rollup_start ... rollup_end] [1M Lag] [event_date]`) verhindert, dass Transaktionen aus dem Antragsmonat in die Features einfliessen.
 
 **Warum kein Validierungsset?**
 Da Hyperparameter-Tuning und Modellselektion über **stratifizierte k-Fold Cross-Validation** auf dem Trainingsset erfolgen, ist ein separates Validierungsset überflüssig. Der 80/20-Split maximiert die verfügbare Trainingsmenge — wichtig bei einem kleinen Datensatz mit moderatem Klassenungleichgewicht.
@@ -1531,24 +1621,58 @@ axes[0, 0].set_xlabel("Monate nach Kontoeröffnung")
 axes[0, 0].set_ylabel("Dichte")
 axes[0, 0].legend()
 
-# (0,1) Kalenderzeit-Verteilung der Ereignisdaten
+# (0,1) Kalenderzeit-Dichte der Ereignisdaten + kumulatives Kundenwachstum
+# Linke Achse: KDE der event_date je Target (Dichte)
+# Rechte Achse: kumulative Anzahl eröffneter Accounts (Customer Growth)
 for t in [1, 0]:
     subset = study_table[study_table["target"] == t]
-    event_months = subset["event_date"].dt.to_period("M").dt.to_timestamp()
-    monthly = event_months.value_counts().sort_index()
-    axes[0, 1].plot(
-        monthly.index,
-        monthly.values,
-        label=labels_map[t],
+    event_numeric = subset["event_date"].astype("int64")
+    sns.kdeplot(
+        x=event_numeric,
+        ax=axes[0, 1],
         color=colors[t],
+        label=labels_map[t],
+        fill=True,
+        alpha=0.25,
         linewidth=2,
-        alpha=0.8,
     )
-axes[0, 1].set_title("Kalenderzeit-Verteilung der Ereignisdaten")
+
+# X-Achse zurück in Datumsformat übersetzen (KDE arbeitete auf int64-ns)
+xticks_numeric = axes[0, 1].get_xticks()
+xticks_dt = pd.to_datetime(xticks_numeric.astype("int64"))
+axes[0, 1].set_xticks(xticks_numeric)
+axes[0, 1].set_xticklabels([d.strftime("%Y-%m") for d in xticks_dt], rotation=45)
+
+axes[0, 1].set_title(
+    "Kalenderzeit-Dichte der Ereignisdaten\n+ kumulatives Kundenwachstum"
+)
 axes[0, 1].set_xlabel("Kalenderdatum")
-axes[0, 1].set_ylabel("Anzahl Ereignisse")
-axes[0, 1].tick_params(axis="x", rotation=45)
-axes[0, 1].legend()
+axes[0, 1].set_ylabel("Dichte (KDE)")
+
+# Twin-Achse: kumulative Account-Eröffnungen
+ax_growth = axes[0, 1].twinx()
+account_growth = (
+    account[["account_id", "date"]]
+    .sort_values("date")
+    .assign(cum_accounts=lambda d: np.arange(1, len(d) + 1))
+)
+ax_growth.plot(
+    account_growth["date"].astype("int64"),
+    account_growth["cum_accounts"],
+    color="C2",
+    linewidth=2,
+    linestyle="--",
+    label="Kumulative Accounts",
+)
+ax_growth.set_ylabel("Kumulative Anzahl eröffneter Accounts", color="C2")
+ax_growth.tick_params(axis="y", labelcolor="C2")
+
+# Legenden kombinieren
+lines_kde, labels_kde = axes[0, 1].get_legend_handles_labels()
+lines_growth, labels_growth = ax_growth.get_legend_handles_labels()
+axes[0, 1].legend(
+    lines_kde + lines_growth, labels_kde + labels_growth, loc="upper left", fontsize=8
+)
 
 # (1,0) Boxplot: months_to_event nach Target
 box_data = [
@@ -1593,11 +1717,15 @@ print(study_table.groupby("target")["months_to_event"].describe().round(1).to_st
 
 ### Interpretation der Verteilungsvergleiche
 
-**Tenure-Matching (oben links):** Die Verteilung des Kontoalters zum Ereigniszeitpunkt (`months_to_event`) zeigt eine hohe Übereinstimmung zwischen Käufern und Nicht-Käufern. Dies bestätigt, dass die Pseudo-Ereignisdaten die Tenure-Struktur der echten Kartenbesitzer gut replizieren. Die empirische Verteilung stammt ausschliesslich aus **Train-Card-Holders** — Testdaten sind nicht eingeflossen.
+**Tenure-Matching (oben links):** Die Verteilung des Kontoalters zum Ereigniszeitpunkt (`months_to_event`) zeigt eine **annähernde, aber keine vollständige** Übereinstimmung zwischen Käufern und Nicht-Käufern. Käufer haben zum Ereigniszeitpunkt systematisch längere Kontohistorien (Median: 27 Monate, Mean: 31.3) als Nicht-Käufer (Median: 21 Monate, Mean: 23.7). Im Histogram ist das klar erkennbar: Nicht-Käufer sind stark auf 13–25 Monate konzentriert, während Käufer flacher und weiter nach rechts verteilt sind.
 
-**Kalenderzeit (oben rechts):** Die Kalenderzeitverteilung der Nicht-Käufer-Ereignisse ist breiter gestreut als bei den Käufern, da Nicht-Käufer-Konten über den gesamten Zeitraum eröffnet wurden. Dies ist erwünscht — es bedeutet, dass die Nicht-Käufer nicht künstlich auf das gleiche Kalenderfenster komprimiert werden.
+Die Ursache liegt in einer strukturellen Einschränkung der Pseudo-Event-Zuweisung: Viele Nicht-Käufer-Konten wurden erst spät eröffnet (1996/97) und haben deshalb ein kleines Fenster zwischen Kontoöffnung und Datenende (`max_months`). Die langen Tenures aus dem rechten Schwanz der Käufer-Verteilung (27–40+ Monate) sind für diese Konten schlicht nicht erreichbar. Das Sampling kann die Buyer-Verteilung im oberen Bereich nicht replizieren. Die empirische Verteilung stammt ausschließlich aus **Train-Card-Holders**.
 
-**Boxplot (unten links):** Beide Gruppen verlieren Konten mit weniger als 13 Monaten Tenure (12M Rollup + 1M Lag), da der Constraint symmetrisch angewendet wird.
+Als Konsequenz ist `months_to_event` ein prädiktiver Feature — Modelle können längere Tenure als Käufer-Signal lernen. Dies spiegelt teils echtes Verhalten wider (längere Kundenbeziehung → höhere Kartenaffinität), ist teils aber auch ein Studiendesign-Artefakt der beschriebenen Feasibility-Einschränkung.
+
+**Kalenderzeit (oben rechts):** Die KDE der Käufer-Events ist deutlich nach 1997/98 verschoben, während die Pseudo-Events der Nicht-Käufer breiter gestreut sind, da deren Konten über den gesamten Zeitraum eröffnet wurden. Dies ist erwünscht — die Nicht-Käufer werden nicht künstlich auf das gleiche Kalenderfenster komprimiert. Die gestrichelte grüne Linie auf der rechten Y-Achse zeigt das **kumulative Kundenwachstum** (Account-Eröffnungen). Auffällig: Die Steigung der Käufer-Events 1997/98 fällt mit der Phase des stärksten Kundenwachstums zusammen. Die zeitliche Konzentration der Card-Events ist also teilweise ein **Grösseneffekt der wachsenden Eligible-Population** und nicht ausschließlich ein Verhaltenseffekt — ein wichtiger Hinweis für die Interpretation kalenderbasierter Cluster.
+
+**Boxplot (unten links):** Beide Gruppen erfüllen das 13-Monats-Minimum (12M Rollup + 1M Lag), was den symmetrisch angewendeten Constraint bestätigt. Gleichzeitig visualisiert der Boxplot die Diskrepanz aus dem oberen Panel deutlich: Die Box der Käufer (IQR: 20–40 Monate) ist deutlich breiter und höher als jene der Nicht-Käufer (IQR: 17–27 Monate), was die systematisch längere Tenure der Käufer zum Ereigniszeitpunkt unterstreicht.
 
 **Stratifizierung (unten rechts):** Das Balkendiagramm bestätigt, dass die Target-Klassen gleichmässig über Train und Test verteilt sind — der stratifizierte Split funktioniert korrekt.
 
@@ -1736,6 +1864,15 @@ Für jedes Konto gilt: `[rollup_start ... rollup_end] [1 Monat Lag] [event_date]
 - Empirische Verteilung stammt ausschliesslich aus Train-Daten → kein Leakage in Test
 - Klassenverhältnis konsistent über beide Splits (~13–16% Target=1)
 - **Kein separates Validierungsset:** Modellselektion und Hyperparameter-Tuning erfolgen via stratifizierter k-Fold Cross-Validation auf dem Trainingsset
+
+#### In-Time vs. Out-of-Time
+
+- **Gewählt:** **in-time**, zufälliger stratifizierter Random-Split (`sklearn.train_test_split(..., stratify=target)`). Train und Test stammen also aus demselben Kalenderzeitfenster.
+- **Begründung:**
+  - **Kleiner Datensatz** (n ≈ 3'900 Konten nach Eligibility) — ein out-of-time Cutoff würde das Testset auf ca. 150 Konten schrumpfen lassen, mit entsprechend instabilen Schätzern für ROC-AUC, Precision/Recall und Lift.
+  - **Card-Events konzentrieren sich auf 1997/98** (siehe KDE der Event-Daten oben) — ein chronologischer Cutoff im oder vor diesem Fenster würde das Train/Test-Klassenverhältnis stark verzerren, da ein grosser Anteil der Positiven nur einseitig (links oder rechts vom Cutoff) verfügbar wäre.
+  - **Tenure-Matching** (`months_to_event`-Sampling aus der Train-Verteilung) eliminiert bereits den **Immortal Time Bias**. Die zeitliche Synchronisation zwischen Käufern und Nicht-Käufern ist also schon strukturell hergestellt — der Kalendarzeit-Schutz, den ein out-of-time-Split zusätzlich liefert, ist hier weniger relevant.
+- **Was wir damit aufgeben:** Keine direkte Simulation eines Produktions-Deployments mit Future-Cutoff (Concept Drift / Covariate Shift über die Zeit wird nicht explizit getestet). Für die Kampagnen-Empfehlung ist das vertretbar, weil das Modell auf einer **prioritisierten Liste (Top-N% Ranking)** basiert — eine relative Ordnung von Kunden, nicht eine kalenderbasierte Punktprognose. Die Schwächen eines in-time Splits (optimistische Schätzung bei zeitlich driftender Population) werden bei Bedarf in einer späteren Validierungsrunde mit frischen Daten adressiert.
 
 ### Klassenungleichgewicht
 Moderates Ungleichgewicht. Empfohlene Massnahmen beim Modeling:

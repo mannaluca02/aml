@@ -19,9 +19,11 @@ In dieser Phase werden **prädiktive Modelle** trainiert und validiert. Ziel ist
 2. **Handcrafted:** Logistische Regression mit ~65 handgefertigten Features (Baseline + Static + Behavioral + Window, ohne tsfresh)
 3. **Random Forest** — Alle ~250 Features (inkl. deduplizierte tsfresh)
 4. **HistGradient Boosting (balanced)** — Alle ~250 Features, mit class_weight
-5. **HistGradient Boosting (unweighted)** — Alle ~250 Features, ohne class_weight
+5. **XGBoost** — Alle ~250 Features, mit `scale_pos_weight` zur Behandlung der Klassen-Imbalance
 
-**Methodik:** StratifiedKFold (k=5) Cross-Validation auf dem Training-Set, finale Evaluation auf dem gehaltenen Test-Set. `class_weight="balanced"` wo angegeben.
+Die zuvor evaluierte HistGBT-Variante ohne `class_weight` wurde entfernt: Sie war zu ihrer balancierten Schwester weitgehend redundant (identische Architektur, lediglich unterschiedliche Loss-Gewichtung) und brachte keinen substanziellen Mehrwert. Stattdessen liefert **XGBoost** echte Architektur-Diversität (eigener Boosting-Algorithmus, andere Regularisierung, eigenes Tree-Building) im Ensemble-Vergleich.
+
+**Methodik:** StratifiedKFold (k=5) Cross-Validation auf dem Training-Set, finale Evaluation auf dem gehaltenen Test-Set. `class_weight="balanced"` bzw. `scale_pos_weight` wo angegeben.
 
 ```{python}
 import warnings
@@ -48,6 +50,7 @@ from sklearn.model_selection import (
     cross_validate,
 )
 from sklearn.inspection import permutation_importance
+from xgboost import XGBClassifier
 
 import wandb
 
@@ -64,6 +67,7 @@ from src.modeling import (
     compare_top_n_lists,
     plot_feature_importance,
     plot_confusion_matrices,
+    check_param_at_boundary,
     SCORING_PRIMARY,
     SCORING_METRICS,
     N_ITER_RANDOM_SEARCH,
@@ -122,6 +126,18 @@ print(f"Test:  {len(y_test)} ({y_test.sum()} positiv, {y_test.mean():.1%})")
 
 cv = get_cv_splitter()
 ```
+
+# Metrikwahl: Warum ROC-AUC primär und AP gleichwertig
+
+**Klassenungleichgewicht.** Die Zielvariable hat eine Prävalenz von rund 13 % (vgl. Train/Test-Verteilung oben). Damit liegt eine *moderate* Imbalance vor — stark genug, um die Wahl der Evaluationsmetrik zur kritischen Designentscheidung zu machen, aber nicht so extrem, dass Accuracy oder F1 grundsätzlich unbrauchbar wären. Bei ~13 % Positivrate würde ein triviales "alles negativ"-Modell bereits 87 % Accuracy erzielen, ohne einen einzigen Käufer zu identifizieren — Accuracy scheidet als Hauptmetrik daher aus.
+
+**ROC-AUC als Hauptmetrik.** Wir verwenden ROC-AUC (`SCORING_PRIMARY = "roc_auc"`) als Optimierungsziel für Hyperparameter-Tuning und Modellvergleich. Die Metrik ist schwellenwert-unabhängig, bounded auf [0.5, 1] für nicht-triviale Klassifikatoren und besitzt eine **direkte Ranking-Interpretation**: ROC-AUC ist die Wahrscheinlichkeit, dass ein zufällig gewählter Käufer einen höheren Score erhält als ein zufällig gewählter Nicht-Käufer. Diese Lesart deckt sich exakt mit der Geschäftsanforderung — wir wollen Kunden für eine Top-N%-Kampagne **sortieren**, nicht zwingend einen Hard-Cutoff treffen. Damit ist ROC-AUC anwendungsnah und nicht bloss eine technische Konvention (vgl. Fawcett, 2006).
+
+**Average Precision (PR-AUC) als gleichwertige zweite Metrik.** ROC-AUC hat bei imbalancierten Daten einen bekannten Schwachpunkt: Da die False-Positive-Rate auf die (grosse) Negativklasse normalisiert ist, lassen viele True Negatives die FPR künstlich niedrig erscheinen. ROC-Kurven können dadurch zu optimistisch wirken. Die **Precision-Recall-Kurve** fokussiert dagegen ausschliesslich auf die Positivklasse und ist daher informativer, sobald die positive Klasse selten ist. Average Precision (= Fläche unter der PR-Kurve) wird in diesem Notebook **gleichberechtigt** zu ROC-AUC berichtet — in den CV-Vergleichstabellen, im Bar-Chart neben ROC-AUC und in der finalen Evaluations-Tabelle (vgl. Davis & Goadrich, 2006).
+
+**Konsequenz für dieses Projekt.** Beide Metriken werden CV- und Test-seitig berichtet. ROC-AUC bleibt das Optimierungsziel im `RandomizedSearchCV` (Single-Metric Search), aber AP wird in allen Vergleichstabellen und Plots gleichwertig geführt. **Tie-Breaker-Regel:** Falls zwei Modelle bei ROC-AUC praktisch gleichauf liegen, entscheidet die schwächere Metrik der beiden (AP), um auf die Positivklasse zu fokussieren — wobei die Anwendung als Ranking-Problem (Top-N% Kontaktliste) den Primat von ROC-AUC rechtfertigt.
+
+**Sekundäre Metriken.** Zusätzlich werden F1, Precision und Recall bei Default-Threshold 0.5 berichtet, um die Klassifikationsleistung an einem konkreten Cutoff zu charakterisieren. Geschäftsrelevant sind ausserdem **Lift@10 %** und **Precision@Top-N %** — diese spiegeln direkt den ökonomischen Nutzen einer priorisierten Kampagnenliste wider und werden im Deliverable-Teil weiter unten ausgewiesen.
 
 # Baseline-Modell: Logistische Regression (5 Features)
 
@@ -227,18 +243,24 @@ for metric in SCORING_METRICS:
 
 # Kandidatenmodelle (Tree-basiert)
 
-Drei Ensemble-Modelle mit **allen ~250 Features** (inkl. deduplizierte tsfresh + behavioral + window). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=30).
+Drei Ensemble-Modelle mit **allen ~250 Features** (inkl. deduplizierte tsfresh + behavioral + window). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=60). Die Suchräume wurden bewusst breit gewählt, damit das Optimum mit hoher Wahrscheinlichkeit *innerhalb* des Grids liegt — ein Boundary-Check nach jedem Tuning warnt, falls ein bester Parameter am Rand der vorgegebenen Range liegt.
 
 ```{python}
 all_cols = feature_sets["all_features"]
+
+# scale_pos_weight für XGBoost: Verhältnis Negativ:Positiv im Train-Set.
+# So gewichtet XGBoost den Loss-Beitrag der Positivklasse hoch (≈ class_weight="balanced").
+neg_pos_ratio = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+print(f"scale_pos_weight (neg/pos) = {neg_pos_ratio:.3f}")
 
 # Model configurations
 # Note: GradientBoostingClassifier was removed — it doesn't support n_jobs
 # and is prohibitively slow with ~1576 features (50 iter × 5 folds = 250
 # sequential fits, each with up to 500 trees). HistGradientBoosting is
 # 10-100× faster and achieves comparable or better performance.
-# We use two HGBC variants instead: one with class_weight="balanced",
-# one without (uses default threshold, different regularization).
+# Die zuvor evaluierte HistGBT-Variante ohne class_weight wurde entfernt:
+# Sie war zur balanced-Variante weitgehend redundant. Stattdessen liefert
+# XGBoost echte Architektur-Diversität (eigenes Boosting, eigene Regularisierung).
 
 candidate_configs = {
     "RandomForest": {
@@ -248,11 +270,11 @@ candidate_configs = {
             n_jobs=-1,
         ),
         "params": {
-            "model__n_estimators": [100, 200],
-            "model__max_depth": [5, 10, 20, None],
+            "model__n_estimators":    [100, 300, 500, 1000],
+            "model__max_depth":       [5, 10, 20, None],
             "model__min_samples_split": [2, 5, 10],
-            "model__min_samples_leaf": [1, 2, 5, 10],
-            "model__max_features": ["sqrt", "log2", 0.1, 0.3],
+            "model__min_samples_leaf":  [1, 2, 5, 10],
+            "model__max_features":      ["sqrt", "log2", 0.1, 0.3],
         },
         "scale": False,
     },
@@ -262,26 +284,32 @@ candidate_configs = {
             random_state=RANDOM_STATE,
         ),
         "params": {
-            "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "model__max_iter": [100, 200, 500],
-            "model__max_depth": [3, 5, 7, None],
+            "model__learning_rate":   [0.01, 0.03, 0.05, 0.1, 0.2],
+            "model__max_iter":        [100, 300, 500, 1000, 2000],
+            "model__max_depth":       [3, 5, 7, None],
             "model__min_samples_leaf": [5, 10, 20, 50],
-            "model__max_leaf_nodes": [15, 31, 63, None],
-            "model__l2_regularization": [0, 0.1, 1.0, 10.0],
+            "model__max_leaf_nodes":   [15, 31, 63, None],
+            "model__l2_regularization":[0, 0.1, 1.0, 10.0],
         },
         "scale": False,
     },
-    "HistGBT (unweighted)": {
-        "model": HistGradientBoostingClassifier(
+    "XGBoost": {
+        "model": XGBClassifier(
+            scale_pos_weight=neg_pos_ratio,
             random_state=RANDOM_STATE,
+            eval_metric="auc",
+            n_jobs=-1,
+            tree_method="hist",
         ),
         "params": {
-            "model__learning_rate": [0.01, 0.05, 0.1, 0.2],
-            "model__max_iter": [100, 200, 500],
-            "model__max_depth": [3, 5, 7, None],
-            "model__min_samples_leaf": [5, 10, 20, 50],
-            "model__max_leaf_nodes": [15, 31, 63, None],
-            "model__l2_regularization": [0, 0.1, 1.0, 10.0],
+            "model__n_estimators":     [200, 500, 1000, 2000],
+            "model__learning_rate":    [0.01, 0.03, 0.1, 0.2],
+            "model__max_depth":        [3, 5, 7, 10],
+            "model__min_child_weight": [1, 5, 10],
+            "model__subsample":        [0.6, 0.8, 1.0],
+            "model__colsample_bytree": [0.5, 0.7, 1.0],
+            "model__reg_alpha":        [0, 0.1, 1.0],
+            "model__reg_lambda":       [0.1, 1.0, 10.0],
         },
         "scale": False,
     },
@@ -289,6 +317,7 @@ candidate_configs = {
 
 # Run RandomizedSearchCV for each candidate
 best_candidates = {}
+boundary_warnings = {}
 for name, cfg in candidate_configs.items():
     print(f"\n{'='*60}")
     print(f"Tuning: {name}")
@@ -313,7 +342,19 @@ for name, cfg in candidate_configs.items():
     print(f"Beste Parameter:")
     for k, v in search.best_params_.items():
         print(f"  {k}: {v}")
+
+    # Boundary-Check: Warnen, falls beste Parameter am Rand der Grid liegen
+    warns = check_param_at_boundary(search.best_params_, cfg["params"])
+    boundary_warnings[name] = warns
+    if warns:
+        print(f"\n  >>> Boundary-Warnungen für {name}:")
+        for w in warns:
+            print(f"    {w}")
+    else:
+        print(f"\n  ✓ Keine Boundary-Hits — alle besten Parameter liegen im Inneren der Grid.")
 ```
+
+> **Hinweis zum Boundary-Check:** Wenn Warnungen erscheinen, deuten sie auf einen *suboptimalen Suchraum* hin — das wahre Optimum liegt vermutlich ausserhalb der aktuellen Range. In diesem Fall sollten die betroffenen Parameter-Listen erweitert und das Tuning wiederholt werden. Boundary-Hits sind ein häufiger, aber leicht übersehener Fehler in der Praxis und werden hier explizit erkannt, um die Modellqualität abzusichern.
 
 ```{python}
 # Cross-validate each best candidate with all metrics
@@ -336,7 +377,7 @@ for name, search in best_candidates.items():
 
 # Cross-Validation Vergleich (Deliverable)
 
-Vergleich aller 5 Modelle anhand der CV-Metriken auf dem Training-Set.
+Vergleich aller 5 Modelle anhand der CV-Metriken auf dem Training-Set. **ROC-AUC** und **Average Precision** stehen als gleichwertige Hauptmetriken in den ersten beiden Spalten und werden farblich hervorgehoben.
 
 ```{python}
 # Collect all CV results
@@ -359,34 +400,53 @@ for name, cv_res in all_cv.items():
 
 cv_table = pd.DataFrame(rows)
 
-# Display formatted
+# Reihenfolge: ROC-AUC und AP als erste beiden Metriken nach "Model"
+metric_order = ["roc_auc", "average_precision", "f1", "precision", "recall"]
+
+# Numerische Spalten für Gradient-Highlighting
+numeric_means = cv_table[["Model"] + [f"{m}_mean" for m in metric_order]].copy()
+numeric_means.columns = ["Model"] + metric_order
+
+# Formatierte String-Spalten für Anzeige (mean ± std)
 display_cols = ["Model"]
-for metric in SCORING_METRICS:
+for metric in metric_order:
     cv_table[metric] = cv_table.apply(
         lambda r: f"{r[f'{metric}_mean']:.4f} ± {r[f'{metric}_std']:.4f}", axis=1
     )
     display_cols.append(metric)
 
 print("Cross-Validation Ergebnisse (Mean ± Std):")
-display(cv_table[display_cols].style.set_caption("CV Performance aller Modelle"))
+# Hauptmetriken (ROC-AUC, AP) farblich hervorheben via background_gradient
+styled = (
+    numeric_means.style
+    .background_gradient(subset=["roc_auc", "average_precision"], cmap="Greens")
+    .format({m: "{:.4f}" for m in metric_order})
+    .set_caption("CV Performance aller Modelle — ROC-AUC und AP als gleichwertige Hauptmetriken")
+)
+display(styled)
+
+# Zusätzlich: vollständige Tabelle mit Mean ± Std als Text
+display(cv_table[display_cols].style.set_caption("CV Performance — Mean ± Std"))
 
 # Log to W&B
 wandb.log({"cv_comparison": wandb.Table(dataframe=cv_table[display_cols])})
 ```
 
 ```{python}
-# Bar chart: CV ROC-AUC comparison
-fig, ax = plt.subplots(figsize=(10, 5))
+# Bar chart: CV ROC-AUC und Average Precision nebeneinander
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 models = [r["Model"] for r in rows]
+
+# ── Linkes Panel: ROC-AUC ───────────────────────────────────────────────
 auc_means = [r["roc_auc_mean"] for r in rows]
 auc_stds = [r["roc_auc_std"] for r in rows]
 
-bars = ax.barh(models, auc_means, xerr=auc_stds, capsize=5)
+ax = axes[0]
+bars_auc = ax.barh(models, auc_means, xerr=auc_stds, capsize=5, color="#2E7D32")
 ax.set_xlabel("ROC-AUC (CV Mean ± Std)")
 ax.set_title("Cross-Validation ROC-AUC Vergleich")
 ax.set_xlim(0.5, 1.0)
-
-for bar, val in zip(bars, auc_means):
+for bar, val in zip(bars_auc, auc_means):
     ax.text(
         val + 0.01,
         bar.get_y() + bar.get_height() / 2,
@@ -395,8 +455,33 @@ for bar, val in zip(bars, auc_means):
         fontsize=10,
     )
 
+# ── Rechtes Panel: Average Precision ────────────────────────────────────
+ap_means = [r["average_precision_mean"] for r in rows]
+ap_stds = [r["average_precision_std"] for r in rows]
+
+ax = axes[1]
+bars_ap = ax.barh(models, ap_means, xerr=ap_stds, capsize=5, color="#1565C0")
+ax.set_xlabel("Average Precision (CV Mean ± Std)")
+ax.set_title("Cross-Validation Average Precision Vergleich")
+# AP-Skala dynamisch: untere Grenze = Prävalenz (Zufalls-Baseline)
+prevalence = y_train.mean()
+ax.set_xlim(max(0.0, prevalence - 0.05), 1.0)
+ax.axvline(prevalence, color="k", linestyle="--", alpha=0.5,
+           label=f"Prävalenz (Zufall) = {prevalence:.3f}")
+ax.legend(loc="lower right")
+for bar, val in zip(bars_ap, ap_means):
+    ax.text(
+        val + 0.01,
+        bar.get_y() + bar.get_height() / 2,
+        f"{val:.4f}",
+        va="center",
+        fontsize=10,
+    )
+
+fig.suptitle("CV-Vergleich: ROC-AUC und Average Precision gleichwertig",
+             fontsize=13, fontweight="bold", y=1.02)
 fig.tight_layout()
-wandb.log({"cv_roc_auc_comparison": wandb.Image(fig)})
+wandb.log({"cv_roc_auc_and_ap_comparison": wandb.Image(fig)})
 plt.show()
 ```
 
@@ -483,6 +568,8 @@ fig = plot_pr_curves(test_results)
 wandb.log({"pr_curves": wandb.Image(fig)})
 plt.show()
 ```
+
+**Interpretation der PR-Curve:** Die Fläche unter der Precision-Recall-Kurve entspricht der **Average Precision (AP)** und ist bei unserer Prävalenz von ~13 % die *informativere* der beiden bounded-Scores: ROC-AUC kann durch die hohe Anzahl an True Negatives bei imbalancierten Daten zu optimistisch wirken, während AP rein auf die Positivklasse fokussiert. Die horizontale Linie bei `prevalence` ≈ 0.13 ist die Zufalls-Baseline — jedes Modell, das diese Linie deutlich überschreitet, identifiziert Käufer überzufällig.
 
 # Top-N% Kundenlisten (Deliverable)
 
@@ -684,7 +771,7 @@ wandb.log({"final_comparison": wandb.Table(dataframe=final_table)})
 ## Business-Empfehlung
 
 **Modellwahl:**
-Das beste Modell nach Test ROC-AUC wird für die Kampagne empfohlen. Tree-basierte Ensemble-Modelle übertreffen die logistische Regression deutlich, da sie komplexe Interaktionen zwischen den ~1'576 Features erfassen können.
+Das beste Modell nach Test **ROC-AUC** wird für die Kampagne empfohlen — die Anwendung ist ein Ranking-Problem (Top-N% Kontaktliste), und ROC-AUC misst genau diese Ranking-Qualität. Bei einem Patt zwischen zwei Modellen (ROC-AUC-Differenz innerhalb der CV-Standardabweichung) wird die **Average Precision** als Tie-Breaker verwendet, da sie bei der gegebenen Prävalenz von ~13 % stärker auf die Positivklasse fokussiert. Tree-basierte Ensemble-Modelle übertreffen die logistische Regression deutlich, da sie komplexe Interaktionen zwischen den ~250 Features erfassen können.
 
 **Kampagnengrösse:**
 - **Top-5%** (~39 Kunden): Höchste Precision — ideal für ein begrenztes Budget oder eine Pilot-Kampagne
@@ -719,7 +806,9 @@ Der Einsatz von KI-Tools hat den Entwicklungsprozess erheblich beschleunigt, ins
 1. Berka, P. (1999). *PKDD'99 Discovery Challenge: Czech Bank Financial Dataset.* Prague University of Economics.
 2. Pedregosa, F. et al. (2011). *Scikit-learn: Machine Learning in Python.* JMLR 12, pp. 2825–2830.
 3. Christ, M. et al. (2018). *Time Series FeatuRe Extraction on basis of Scalable Hypothesis tests (tsfresh — A Python package).* Neurocomputing 307, pp. 72–77.
-4. Anthropic. (2025). *Claude Code.* https://claude.ai/code
+4. Fawcett, T. (2006). *An introduction to ROC analysis.* Pattern Recognition Letters 27(8), pp. 861–874.
+5. Davis, J. & Goadrich, M. (2006). *The Relationship Between Precision-Recall and ROC Curves.* Proceedings of the 23rd International Conference on Machine Learning (ICML).
+6. Anthropic. (2025). *Claude Code.* https://claude.ai/code
 
 ```{python}
 wandb.finish()

@@ -523,28 +523,62 @@ def select_tsfresh_by_correlation(
     # Align indices
     common_idx = tsfresh_df.index.intersection(y.index)
     X = tsfresh_df.loc[common_idx]
-    y_aligned = y.loc[common_idx]
+    y_aligned = y.loc[common_idx].astype(float)
 
-    # Correlation with target
-    target_corr = X.corrwith(y_aligned).abs().sort_values(ascending=False)
-    target_corr = target_corr.dropna()
+    # Drop zero-variance / non-finite columns up front so they never enter
+    # the Pearson correlation (which would otherwise emit
+    # "invalid value encountered in divide" RuntimeWarnings).
+    col_std = X.std(axis=0, ddof=0)
+    keep_mask = col_std.gt(0) & np.isfinite(col_std)
+    if not keep_mask.any():
+        return []
+    X = X.loc[:, keep_mask]
 
-    selected = []
-    selected_data = pd.DataFrame(index=X.index)
+    cols = X.columns.to_numpy()
+    X_np = X.to_numpy(dtype=np.float64, copy=False)
+    y_np = y_aligned.to_numpy(dtype=np.float64, copy=False)
 
-    for col in target_corr.index:
-        if len(selected) == 0:
-            selected.append(col)
-            selected_data[col] = X[col]
+    n_rows = X_np.shape[0]
+
+    # Standardize each column once (population stddev — matches numpy's
+    # corrcoef convention). After this, Pearson correlation between any two
+    # columns is just  (a · b) / n_rows.
+    col_mean = X_np.mean(axis=0)
+    col_std_np = X_np.std(axis=0, ddof=0)
+    X_std = (X_np - col_mean) / col_std_np
+
+    # Target correlation (standardized y_aligned dot standardized X column)
+    y_centered = y_np - y_np.mean()
+    y_std_val = y_np.std(ddof=0)
+    if y_std_val == 0:
+        return []
+    y_z = y_centered / y_std_val
+
+    target_corr_abs = np.abs(X_std.T @ y_z) / n_rows
+
+    # Drop columns whose target correlation is NaN/inf (defensive — should
+    # be impossible after the zero-variance filter, but cheap insurance)
+    finite_mask = np.isfinite(target_corr_abs)
+    if not finite_mask.all():
+        X_std = X_std[:, finite_mask]
+        cols = cols[finite_mask]
+        target_corr_abs = target_corr_abs[finite_mask]
+
+    # Greedy selection in order of decreasing target correlation
+    order = np.argsort(-target_corr_abs)
+
+    selected_idx: list[int] = []
+    for j in order:
+        x_j = X_std[:, j]
+        if not selected_idx:
+            selected_idx.append(int(j))
             continue
+        # Pairwise corr between candidate j and all already-kept columns
+        kept_corr = np.abs(X_std[:, selected_idx].T @ x_j) / n_rows
+        if (kept_corr < corr_threshold).all():
+            selected_idx.append(int(j))
 
-        # Check correlation with all already-selected features
-        corrs = selected_data.corrwith(X[col]).abs()
-        if (corrs < corr_threshold).all():
-            selected.append(col)
-            selected_data[col] = X[col]
-
-    return selected
+    return [str(cols[i]) for i in selected_idx]
 
 
 # ── Baseline Features (5 required) ──────────────────────────────────────────

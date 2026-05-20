@@ -415,6 +415,95 @@ plt.tight_layout()
 plt.show()
 ```
 
+## Übersicht aller handgefertigten Features
+
+Das Modell kombiniert zwei Feature-Arten: **handgefertigte Features** mit expliziter domänen-spezifischer Rationale (Domain Knowledge aus Bank- und Marketing-Kontext) sowie **tsfresh-extrahierte Zeitreihenfeatures** als breite, automatische Ergänzung. Die folgende Master-Tabelle dokumentiert alle **64 unique handgefertigten Features** (5 Baseline + 17 Static-only + 30 Behavioral + 12 Window — `age_at_event`, `gender` und `district_avg_salary` erscheinen sowohl in `BASELINE_FEATURE_COLS` als auch `STATIC_FEATURE_COLS` und werden hier einmalig unter Baseline geführt) inklusive Datenquelle, Berechnungslogik und Prognose-Hypothese. Sie dient als zentrale Referenz für Reviewer und Domain Experts.
+
+| Feature | Kategorie | Quelle | Berechnung | Rationale |
+|---|---|---|---|---|
+| `age_at_event` | Baseline | client.birth_date, study_table.event_date | (event_date − birth_date) in Jahren | Lebensphase steuert Kreditkarten-Nachfrage (Erwerbstätige vs. Senioren) |
+| `gender` | Baseline | client.birth_number | 1 wenn männlich, sonst 0 (aus YY(MM+50)DD-Kodierung) | Demografisches Standard-Stratum; geringe erwartete Eigenwirkung, aber Interaktionspotenzial |
+| `district_avg_salary` | Baseline | district.A11 (via account.district_id) | direkter Wert aus Bezirkstabelle | Region-Proxy für Kaufkraft; höhere Gehälter ↔ höhere Affinität zu Premium-Produkten |
+| `balance_last` | Baseline | trans.balance | letzter Saldo im [rollup_start, rollup_end]-Fenster | Vermögensindikator zum Ereigniszeitpunkt; höherer Saldo ↔ höhere Kapazität für Kreditkartenangebot |
+| `turnover` | Baseline | trans.amount | sum(abs(amount)) im Rollup | Aktivitätsniveau des Kontos; aktive Kunden sind eher empfänglich für Cross-Selling |
+| `district_unemployment_96` | District | district.A13 | Arbeitslosenquote 1996 im Bezirk | Wirtschaftliche Lage der Region beeinflusst Kreditrisiko und Konsumneigung |
+| `district_urban_ratio` | District | district.A10 | Anteil städtischer Einwohner im Bezirk | Urbane Kunden zeigen typischerweise höhere Affinität zu bargeldlosen Zahlungsmitteln |
+| `district_inhabitants` | District | district.A4 | Einwohnerzahl des Bezirks | Marktgrösse-Proxy; grössere Bezirke bieten breitere Vergleichsbasis |
+| `district_entrepreneurs` | District | district.A14 | Anzahl Unternehmer im Bezirk | Indikator für wirtschaftliche Dynamik und mögliche Geschäftskunden |
+| `district_crimes_96` | District | district.A16 | Anzahl Verbrechen 1996 im Bezirk | Sozioökonomischer Risikoindikator des Bezirks |
+| `has_loan` | Loan | loan.account_id (mit loan.date ≤ rollup_end) | 1 wenn aktiver Kredit existiert, sonst 0 | Bestehende Kreditbeziehung signalisiert Bereitschaft, Kreditprodukte zu nutzen |
+| `loan_amount` | Loan | loan.amount | Summe der Kreditbeträge (temporal-guarded) | Höhe der bestehenden Verschuldung als Vermögens-/Risiko-Indikator |
+| `loan_monthly_payment` | Loan | loan.payments | Summe der monatlichen Raten (temporal-guarded) | Monatliche Belastung beeinflusst frei verfügbares Einkommen |
+| `order_count` | Order | order.order_id | Anzahl Daueraufträge pro Konto | Aktive Nutzung automatisierter Zahlungen ↔ Affinität zu modernen Bankdienstleistungen |
+| `order_total_amount` | Order | order.amount | sum(amount) aller Daueraufträge | Volumen wiederkehrender Verpflichtungen |
+| `has_insurance_order` | Order | order.k_symbol = "insurance_payment" | 1 wenn Versicherungs-Dauerauftrag existiert, sonst 0 | Vorsorgeverhalten korreliert mit Finanz-Affinität |
+| `has_household_order` | Order | order.k_symbol = "household_payment" | 1 wenn Haushalts-Dauerauftrag existiert, sonst 0 | Strukturierte Ausgabengestaltung als Reife-Indikator |
+| `has_loan_order` | Order | order.k_symbol = "loan_payment" | 1 wenn Kredit-Dauerauftrag existiert, sonst 0 | Bedient bestehende Kredite → eher kreditkartenaffin |
+| `freq_monthly` | Account | account.frequency | One-Hot: 1 wenn "POPLATEK MESICNE" | Standardprofil; Referenzgruppe für Frequenzvergleich |
+| `freq_weekly` | Account | account.frequency | One-Hot: 1 wenn "POPLATEK TYDNE" | Wöchentliche Abrechnung = häufigere Interaktion mit Bank |
+| `freq_after_transaction` | Account | account.frequency | One-Hot: 1 wenn "POPLATEK PO OBRATU" | Transaktionsabhängige Frequenz = besonders aktive Nutzer |
+| `months_to_event` | Account | study_table | Monate von Kontoeröffnung bis Ereignisdatum | Kontoalter; reife Kundenbeziehungen erlauben fundiertere Affinitätsschätzung |
+| `n_transactions` | Behavioral A | trans.account_id | Anzahl Transaktionen im Rollup | Aktivitäts-Volumen; aktive Kunden zeigen mehr Bindung |
+| `n_active_days` | Behavioral A | trans.date | Anzahl distinkter Transaktionstage | Streuung der Aktivität über die Zeit, robuster als reine Anzahl |
+| `avg_amount` | Behavioral A | trans.amount | mean(abs(amount)) im Rollup | Typische Transaktionsgrösse als Wohlstands-Proxy |
+| `std_amount` | Behavioral A | trans.amount | std(abs(amount)) im Rollup | Volatilität der Transaktionsbeträge; stabile Muster ↔ planbare Finanzen |
+| `median_amount` | Behavioral A | trans.amount | median(abs(amount)) im Rollup | Robuste Lagemetrik gegenüber Ausreissern |
+| `balance_range` | Behavioral A | trans.balance | max(balance) − min(balance) im Rollup | Spannweite des Saldos; geringe Spanne ↔ stabile Liquidität |
+| `pct_type_credit` | Behavioral B | trans.type | Anteil der Credit-Transaktionen | Hoher Einkommens-Anteil ↔ regelmässige Gehaltszahlungen |
+| `pct_type_withdrawal` | Behavioral B | trans.type | Anteil der Withdrawal-Transaktionen | Komplement zu pct_type_credit; Konsumneigung |
+| `credit_withdrawal_ratio` | Behavioral B | trans.type | n_credit / (n_withdrawal + 1) | Anteil regelmässiger Einzahlungen (z.B. Gehalt) vs. Auszahlungen — Käufer könnten stabilere Einkommenströme zeigen |
+| `avg_credit_amount` | Behavioral B | trans.amount, trans.type | mean(abs(amount)) wo type = credit | Durchschnittliches Gehalts-/Einkommensniveau |
+| `pct_op_collection_from_another_bank` | Behavioral C | trans.operation | Anteil eingehender Überweisungen externer Banken | Hinweis auf externe Geschäfts-/Mietbeziehungen |
+| `pct_op_credit_in_cash` | Behavioral C | trans.operation | Anteil Bareinzahlungen | Klassisches Verhalten; geringer Anteil ↔ Affinität zu bargeldlosen Mitteln |
+| `pct_op_withdrawal_in_cash` | Behavioral C | trans.operation | Anteil Barabhebungen | Hoher Anteil ↔ präferiertes Bargeldverhalten, eher konservativ |
+| `pct_op_remittance_to_another_bank` | Behavioral C | trans.operation | Anteil ausgehender Überweisungen an externe Banken | Engagiertes Banking-Verhalten, mehrere Bankbeziehungen |
+| `pct_op_credit_card_withdrawal` | Behavioral C | trans.operation | Anteil Kreditkarten-Abhebungen | Direkte Nutzungserfahrung mit Kartenprodukten (falls vorhanden) |
+| `pct_ksym_old_age_pension` | Behavioral D | trans.k_symbol | Anteil Renteneingänge | Senioren-Indikator; Rentner haben oft geringere Kreditkarten-Affinität |
+| `pct_ksym_insurance_payment` | Behavioral D | trans.k_symbol | Anteil Versicherungszahlungen | Vorsorgebewusstsein ↔ Affinität zu Finanzprodukten |
+| `pct_ksym_household_payment` | Behavioral D | trans.k_symbol | Anteil Haushaltszahlungen | Etabliertes Haushaltsmanagement, Verbraucherreife |
+| `pct_ksym_loan_payment` | Behavioral D | trans.k_symbol | Anteil Kreditzahlungen | Aktive Kreditbedienung ↔ kreditkartenkompatibles Profil |
+| `n_distinct_ksymbols` | Behavioral D | trans.k_symbol | Anzahl distinkter (nicht-leerer) Verwendungszwecke | Diversität der Kontonutzung; vielfältige Nutzer sind cross-selling-affiner |
+| `avg_days_between_tx` | Behavioral E | trans.date | mean der Tage zwischen aufeinanderfolgenden Transaktionen | Regelmässigkeit der Nutzung; geringer Abstand ↔ aktiver Kunde |
+| `std_days_between_tx` | Behavioral E | trans.date | std der Tage zwischen Transaktionen | Volatilität der Nutzungsmuster; konstante Muster sind prädiktiv stabiler |
+| `pct_tx_first_week` | Behavioral E | trans.date | Anteil Transaktionen mit Monatstag ≤ 7 | Monatsanfangs-Aktivität (Gehaltszahlungen, Mieten) |
+| `pct_tx_last_week` | Behavioral E | trans.date | Anteil Transaktionen mit Monatstag ≥ 24 | Monatsende-Aktivität, oft Konsum/Wochenende |
+| `n_distinct_banks` | Behavioral E | trans.bank | Anzahl distinkter externer Banken | Multi-Banking-Verhalten ↔ finanzielle Komplexität und Reife |
+| `has_external_bank_tx` | Behavioral E | trans.bank | 1 wenn mind. eine externe Banktransaktion, sonst 0 | Bestehende externe Beziehungen erweitern den Marktkontext |
+| `turnover_per_transaction` | Behavioral F | trans.amount | sum(abs(amount)) / n_transactions | Durchschnittliche Transaktionsgrösse, robust gegenüber Volumen |
+| `balance_to_turnover_ratio` | Behavioral F | trans.balance, trans.amount | balance_last / (sum(abs(amount)) + 1) | Liquiditätsreserve im Verhältnis zum Umsatz; hoher Wert ↔ Sparsamkeit |
+| `net_flow` | Behavioral F | trans.amount, trans.type | sum(credit-amounts) − sum(withdrawal-amounts) | Netto-Geldfluss im Rollup; positiver Fluss ↔ Vermögensaufbau |
+| `net_flow_ratio` | Behavioral F | trans.amount, trans.type | net_flow / (turnover + 1) | Relativer Netto-Fluss, robust gegenüber Kontogrösse |
+| `balance_mean_q1` | Window | trans.balance, trans.date | mean(balance) im Quartal 1 (älteste 3 Monate) | Saldoniveau im frühen Beobachtungsfenster |
+| `balance_mean_q4` | Window | trans.balance, trans.date | mean(balance) im Quartal 4 (jüngste 3 Monate) | Saldoniveau zum Ereigniszeitpunkt |
+| `balance_trend_q1_q4` | Window | trans.balance, trans.date | balance_mean_q4 − balance_mean_q1 | Absoluter Saldo-Trend über das Rollup-Fenster |
+| `balance_trend_q1_q4_pct` | Window | trans.balance, trans.date | (q4 − q1) / (abs(q1) + 1) | Relativer Saldo-Trend; robust gegenüber Niveau |
+| `turnover_h1` | Window | trans.amount, trans.date | sum(abs(amount)) im Halbjahr 1 | Aktivitätsvolumen in der älteren Hälfte |
+| `turnover_h2` | Window | trans.amount, trans.date | sum(abs(amount)) im Halbjahr 2 | Aktivitätsvolumen in der jüngeren Hälfte |
+| `turnover_trend_h1_h2` | Window | trans.amount, trans.date | turnover_h2 − turnover_h1 | Wachsender Umsatz ↔ steigende Bankaktivität |
+| `turnover_trend_h1_h2_pct` | Window | trans.amount, trans.date | (h2 − h1) / (h1 + 1) | Relativer Umsatz-Trend, robust gegenüber Volumen |
+| `n_tx_h1` | Window | trans.account_id, trans.date | Anzahl Transaktionen im Halbjahr 1 | Aktivitätshäufigkeit im älteren Halbjahr |
+| `n_tx_h2` | Window | trans.account_id, trans.date | Anzahl Transaktionen im Halbjahr 2 | Aktivitätshäufigkeit im jüngeren Halbjahr |
+| `tx_count_trend_h1_h2` | Window | trans.account_id, trans.date | n_tx_h2 − n_tx_h1 | Steigende Frequenz ↔ wachsende Bindung an die Bank |
+| `monthly_balance_slope` | Window | trans.balance, trans.date | OLS-Steigung der monatlichen Saldo-Mittelwerte über 12 Monate | Aufwärtstrend des Saldos = wachsende Liquidität = potenziell höhere Affinität zu Premiumprodukten |
+
+### tsfresh-Gruppenübersicht
+
+Zusätzlich zu den 64 handgefertigten Features extrahiert `tsfresh` aus den Zeitreihen `amount` und `balance` ein breites Spektrum statistischer Deskriptoren. Diese werden nicht einzeln gepflegt, sondern via Korrelations-Deduplizierung gefiltert. Die folgende Tabelle gruppiert die ~1'554 tsfresh-Features nach funktionalem Typ:
+
+| tsfresh-Gruppe | Beispielfunktionen | Was wird gemessen |
+|---|---|---|
+| Lageparameter | `mean`, `median`, `quantile_q` | Saldoniveau über den Rollup |
+| Streuung | `std`, `variance`, `mean_abs_change` | Volatilität der Zeitreihe |
+| Autokorrelation | `autocorrelation`, `c3`, `partial_autocorrelation` | Persistenz und Nichtlinearität |
+| Spektral | `fft_coefficient`, `welch_density` | Periodizität (z.B. monatliche Zyklen) |
+| Entropie/Komplexität | `approximate_entropy`, `sample_entropy`, `cid_ce` | Vorhersagbarkeit der Zeitreihe |
+| Trend | `linear_trend`, `agg_linear_trend` | Drift im Saldo/Umsatz |
+| Sonstige | `benford_correlation`, `abs_energy`, `count_above_mean` | diverse Detektoren |
+
+tsfresh extrahiert mit `EfficientFCParameters` ~777 Features pro Zeitreihe (`amount` + `balance` = ~1'554 total), reduziert via Korrelations-Deduplizierung (Schwelle 0.95) auf ~100-200 prädiktiv-relevante Spalten. Die finale Selektion bleibt deutlich kleiner und überlappungsfrei, sodass die handgefertigten Features mit klarer Domänen-Interpretation und die tsfresh-Features mit statistischer Breite einander ergänzen.
+
+Die exakten Definitionen aller Features finden sich in `src/features.py` (Funktionen `compute_baseline_features`, `compute_static_features`, `compute_behavioral_features`, `compute_window_comparison_features`).
+
 ## Feature Matrix zusammenführen
 
 Alle Feature-Gruppen (tsfresh, Baseline, Statisch) werden zu einer einzigen Feature-Matrix zusammengeführt. Die Matrix hat genau eine Zeile pro Konto und enthält `target` und `split` als Metadaten-Spalten.
