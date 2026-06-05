@@ -171,6 +171,94 @@ def load_study_table(path: str | Path | None = None) -> pd.DataFrame:
     return df
 
 
+def assign_pseudo_event_dates(
+    account_df: pd.DataFrame,
+    eligible_non_card_ids: set[int],
+    empirical_months: pd.Series,
+    max_data_date: pd.Timestamp,
+    first_trans: pd.Series,
+    rollup_months: int = ROLLUP_MONTHS,
+    lag_months: int = LAG_MONTHS,
+    random_state: int = RANDOM_STATE,
+) -> pd.DataFrame:
+    """
+    Weist jedem eligible Nicht-Karten-Konto ein Pseudo-Ereignisdatum zu,
+    basierend auf der empirischen Verteilung aus dem Trainingsset.
+
+    Accounts ohne feasible Bereich werden ausgeschlossen (unzureichende Historie).
+    Rollup-Fenster: [event - (rollup_months + lag_months) ... event - lag_months]
+    """
+    rng = np.random.default_rng(random_state)
+    total_history = rollup_months + lag_months
+
+    # Nur eligible Nicht-Karten-Konten
+    non_card = account_df[account_df["account_id"].isin(eligible_non_card_ids)].copy()
+    non_card = non_card.rename(columns={"date": "account_creation_date"})
+    non_card = non_card.merge(first_trans, on="account_id", how="left")
+
+    empirical_values = empirical_months.values
+    max_period = max_data_date.to_period("M")
+
+    # Vectorize: Berechne min/max months pro Konto via Period-Arithmetik
+    creation_periods = non_card["account_creation_date"].dt.to_period("M")
+    first_tx_periods = non_card["first_trans_date"].dt.to_period("M")
+
+    # min_months: event >= first_tx + total_history Monate
+    non_card["min_months"] = (
+        (first_tx_periods + total_history).astype("int64")
+        - creation_periods.astype("int64")
+    ).clip(lower=total_history)
+
+    # max_months: event <= max_data_date
+    non_card["max_months"] = max_period.ordinal - creation_periods.astype("int64")
+
+    # Ausschluss: Konten ohne machbaren Bereich (zu spät eröffnet)
+    infeasible_mask = non_card["max_months"] < non_card["min_months"]
+    n_infeasible = infeasible_mask.sum()
+    if n_infeasible > 0:
+        print(f"  Ausgeschlossen (unzureichende Historie): {n_infeasible} Konten")
+    non_card = non_card[~infeasible_mask].copy()
+
+    # Per-row sampling (unvermeidbar wegen row-spezifischer feasible ranges)
+    def _sample_row(row):
+        feasible = empirical_values[
+            (empirical_values >= row["min_months"])
+            & (empirical_values <= row["max_months"])
+        ]
+        if len(feasible) > 0:
+            return int(rng.choice(feasible))
+        # Fallback: Mitte des machbaren Bereichs (sollte nie eintreten)
+        return int((row["min_months"] + row["max_months"]) // 2)
+
+    non_card["months_to_event"] = non_card.apply(_sample_row, axis=1)
+
+    # Event-Datum und Rollup-Fenster berechnen
+    non_card["event_date"] = non_card.apply(
+        lambda r: r["account_creation_date"]
+        + pd.DateOffset(months=int(r["months_to_event"])),
+        axis=1,
+    )
+    non_card["rollup_end"] = non_card["event_date"].apply(
+        lambda d: (d.to_period("M") - lag_months).to_timestamp()
+    )
+    non_card["rollup_start"] = non_card["event_date"].apply(
+        lambda d: (d.to_period("M") - total_history).to_timestamp()
+    )
+    non_card["target"] = 0
+
+    return non_card[
+        [
+            "account_id",
+            "account_creation_date",
+            "event_date",
+            "rollup_start",
+            "rollup_end",
+            "months_to_event",
+            "target",
+        ]
+    ]
+
+
 def set_plot_style():
     """Apply the project's standard plotting style."""
     import seaborn as sns

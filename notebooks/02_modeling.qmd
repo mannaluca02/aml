@@ -1,7 +1,7 @@
 ---
 title: 'AML - Phase 3: Predictive Modeling & Validation'
 author: Luca Manna
-date: '2026-03-20'
+date: 2026-06-5
 format:
   html:
     toc: true
@@ -12,66 +12,66 @@ lang: de
 jupyter: python3
 ---
 
-In dieser Phase werden **prädiktive Modelle** trainiert und validiert. Ziel ist es, Kunden zu identifizieren, die am wahrscheinlichsten eine Kreditkarte akzeptieren.
-
-**Modelle:**
-1. **Baseline:** Logistische Regression mit 5 Features (Aufgabenanforderung)
-2. **Handcrafted:** Logistische Regression mit ~65 handgefertigten Features (Baseline + Static + Behavioral + Window, ohne tsfresh)
-3. **Random Forest** — Alle ~250 Features (inkl. deduplizierte tsfresh)
-4. **HistGradient Boosting (balanced)** — Alle ~250 Features, mit class_weight
-5. **XGBoost** — Alle ~250 Features, mit `scale_pos_weight` zur Behandlung der Klassen-Imbalance
-
-Die zuvor evaluierte HistGBT-Variante ohne `class_weight` wurde entfernt: Sie war zu ihrer balancierten Schwester weitgehend redundant (identische Architektur, lediglich unterschiedliche Loss-Gewichtung) und brachte keinen substanziellen Mehrwert. Stattdessen liefert **XGBoost** echte Architektur-Diversität (eigener Boosting-Algorithmus, andere Regularisierung, eigenes Tree-Building) im Ensemble-Vergleich.
-
-**Methodik:** StratifiedKFold (k=5) Cross-Validation auf dem Training-Set, finale Evaluation auf dem gehaltenen Test-Set. `class_weight="balanced"` bzw. `scale_pos_weight` wo angegeben.
-
 ```{python}
+import atexit
+import sys
 import warnings
 
-warnings.filterwarnings("ignore")
+# ConvergenceWarning früh importieren und Filter setzen, bevor die schweren
+# Third-Party-Pakete geladen werden, damit deren Import-Warnings unterdrückt werden.
+from sklearn.exceptions import ConvergenceWarning
 
+# Gezielt unterdrücken statt global — unerwartete Warnings bleiben sichtbar
+warnings.filterwarnings(
+    "ignore", category=ConvergenceWarning
+)  # LogReg: max_iter ggf. knapp in einzelnen CV-Folds
+warnings.filterwarnings(
+    "ignore", category=FutureWarning
+)  # sklearn/XGBoost API-Deprecations
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="wandb"
+)  # wandb-interne Meldungen
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
-
-import sys
-
-sys.path.insert(0, "..")
-
-from sklearn.linear_model import LogisticRegression
+import shap
+import wandb
 from sklearn.ensemble import (
-    RandomForestClassifier,
     HistGradientBoostingClassifier,
+    RandomForestClassifier,
 )
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import (
     GridSearchCV,
     RandomizedSearchCV,
     cross_validate,
 )
-from sklearn.inspection import permutation_importance
+from sklearn.pipeline import Pipeline as SKPipeline
 from xgboost import XGBClassifier
 
-import wandb
+sys.path.insert(0, "..")
 
-from src.data import set_plot_style, RANDOM_STATE
+from src.data import PATH_FEATURE_MATRIX, RANDOM_STATE, set_plot_style
 from src.modeling import (
-    get_feature_sets,
-    build_pipeline,
-    get_cv_splitter,
-    evaluate_on_test,
-    plot_roc_curves,
-    plot_pr_curves,
-    plot_lift_curve,
-    compute_top_n_list,
-    compare_top_n_lists,
-    plot_feature_importance,
-    plot_confusion_matrices,
-    check_param_at_boundary,
-    SCORING_PRIMARY,
-    SCORING_METRICS,
     N_ITER_RANDOM_SEARCH,
+    SCORING_METRICS,
+    SCORING_PRIMARY,
     TOP_N_PERCENTILES,
+    build_pipeline,
+    check_param_at_boundary,
+    compare_top_n_lists,
+    compute_top_n_list,
+    evaluate_on_test,
+    get_cv_splitter,
+    get_feature_sets,
+    plot_confusion_matrices,
+    plot_feature_importance,
+    plot_lift_curve,
+    plot_pr_curves,
+    plot_roc_curves,
 )
 
 set_plot_style()
@@ -79,8 +79,6 @@ print("Setup complete.")
 ```
 
 ```{python}
-import atexit
-
 run = wandb.init(
     project="aml-credit-card-affinity",
     name="phase3-modeling-v2",
@@ -96,8 +94,6 @@ atexit.register(lambda: wandb.finish(quiet=True))
 # Daten laden & Train/Test Split
 
 ```{python}
-from src.data import PATH_FEATURE_MATRIX
-
 fm = pd.read_parquet(PATH_FEATURE_MATRIX)
 print(f"Feature-Matrix: {fm.shape[0]} Accounts × {fm.shape[1]} Spalten")
 print(f"Target-Verteilung:\n{fm['target'].value_counts().to_string()}")
@@ -129,19 +125,19 @@ cv = get_cv_splitter()
 
 # Metrikwahl: Warum ROC-AUC primär und AP gleichwertig
 
-**Klassenungleichgewicht.** Die Zielvariable hat eine Prävalenz von rund 13 % (vgl. Train/Test-Verteilung oben). Damit liegt eine *moderate* Imbalance vor — stark genug, um die Wahl der Evaluationsmetrik zur kritischen Designentscheidung zu machen, aber nicht so extrem, dass Accuracy oder F1 grundsätzlich unbrauchbar wären. Bei ~13 % Positivrate würde ein triviales "alles negativ"-Modell bereits 87 % Accuracy erzielen, ohne einen einzigen Käufer zu identifizieren — Accuracy scheidet als Hauptmetrik daher aus.
+**Klassenungleichgewicht.** Die Zielvariable hat eine Prävalenz von rund 13 % (vgl. Train/Test-Verteilung oben). Damit liegt eine *moderate* Imbalance vor, stark genug um die Wahl der Evaluationsmetrik zur kritischen Designentscheidung zu machen, aber nicht so extrem, dass Accuracy oder F1 grundsätzlich unbrauchbar wären. Bei ~13 % Positivrate würde ein triviales "alles negativ"-Modell bereits 87 % Accuracy erzielen, ohne einen einzigen Käufer zu identifizieren. Accuracy scheidet als Hauptmetrik daher aus.
 
-**ROC-AUC als Hauptmetrik.** Wir verwenden ROC-AUC (`SCORING_PRIMARY = "roc_auc"`) als Optimierungsziel für Hyperparameter-Tuning und Modellvergleich. Die Metrik ist schwellenwert-unabhängig, bounded auf [0.5, 1] für nicht-triviale Klassifikatoren und besitzt eine **direkte Ranking-Interpretation**: ROC-AUC ist die Wahrscheinlichkeit, dass ein zufällig gewählter Käufer einen höheren Score erhält als ein zufällig gewählter Nicht-Käufer. Diese Lesart deckt sich exakt mit der Geschäftsanforderung — wir wollen Kunden für eine Top-N%-Kampagne **sortieren**, nicht zwingend einen Hard-Cutoff treffen. Damit ist ROC-AUC anwendungsnah und nicht bloss eine technische Konvention (vgl. Fawcett, 2006).
+**ROC-AUC als Hauptmetrik.** Wir verwenden ROC-AUC (`SCORING_PRIMARY = "roc_auc"`) als Optimierungsziel für Hyperparameter-Tuning und Modellvergleich. Die Metrik ist schwellenwert-unabhängig, bounded auf [0.5, 1] für nicht-triviale Klassifikatoren und besitzt eine **direkte Ranking-Interpretation**: ROC-AUC ist die Wahrscheinlichkeit, dass ein zufällig gewählter Käufer einen höheren Score erhält als ein zufällig gewählter Nicht-Käufer. Diese Lesart deckt sich exakt mit der Geschäftsanforderung: Wir wollen Kunden für eine Top-N%-Kampagne **sortieren**, nicht zwingend einen Hard-Cutoff treffen. Damit ist ROC-AUC anwendungsnah und nicht bloss eine technische Konvention (vgl. Fawcett, 2006).
 
-**Average Precision (PR-AUC) als gleichwertige zweite Metrik.** ROC-AUC hat bei imbalancierten Daten einen bekannten Schwachpunkt: Da die False-Positive-Rate auf die (grosse) Negativklasse normalisiert ist, lassen viele True Negatives die FPR künstlich niedrig erscheinen. ROC-Kurven können dadurch zu optimistisch wirken. Die **Precision-Recall-Kurve** fokussiert dagegen ausschliesslich auf die Positivklasse und ist daher informativer, sobald die positive Klasse selten ist. Average Precision (= Fläche unter der PR-Kurve) wird in diesem Notebook **gleichberechtigt** zu ROC-AUC berichtet — in den CV-Vergleichstabellen, im Bar-Chart neben ROC-AUC und in der finalen Evaluations-Tabelle (vgl. Davis & Goadrich, 2006).
+**Average Precision (PR-AUC) als gleichwertige zweite Metrik.** ROC-AUC hat bei imbalancierten Daten einen bekannten Schwachpunkt: Da die Bewertung der Negativklasse in die Berechnung einfliesst, können ROC-Kurven bei einem grossen Anteil an Nicht-Käufern zu optimistisch wirken. Die **Precision-Recall-Kurve** fokussiert dagegen ausschliesslich auf die Positivklasse und ist daher informativer, sobald die positive Klasse selten ist. Average Precision (= Fläche unter der PR-Kurve) wird in diesem Notebook **gleichberechtigt** zu ROC-AUC berichtet, in den CV-Vergleichstabellen, im Bar-Chart neben ROC-AUC und in der finalen Evaluations-Tabelle (vgl. Davis & Goadrich, 2006).
 
-**Konsequenz für dieses Projekt.** Beide Metriken werden CV- und Test-seitig berichtet. ROC-AUC bleibt das Optimierungsziel im `RandomizedSearchCV` (Single-Metric Search), aber AP wird in allen Vergleichstabellen und Plots gleichwertig geführt. **Tie-Breaker-Regel:** Falls zwei Modelle bei ROC-AUC praktisch gleichauf liegen, entscheidet die schwächere Metrik der beiden (AP), um auf die Positivklasse zu fokussieren — wobei die Anwendung als Ranking-Problem (Top-N% Kontaktliste) den Primat von ROC-AUC rechtfertigt.
+**Konsequenz für dieses Projekt.** Beide Metriken werden CV- und Test-seitig berichtet. ROC-AUC bleibt das Optimierungsziel im `RandomizedSearchCV` (Single-Metric Search), aber AP wird in allen Vergleichstabellen und Plots gleichwertig geführt. **Tie-Breaker-Regel:** Falls zwei Modelle bei ROC-AUC praktisch gleichauf liegen, entscheidet die schwächere Metrik der beiden (AP), um auf die Positivklasse zu fokussieren, wobei die Anwendung als Ranking-Problem (Top-N% Kontaktliste) den Primat von ROC-AUC rechtfertigt.
 
-**Sekundäre Metriken.** Zusätzlich werden F1, Precision und Recall bei Default-Threshold 0.5 berichtet, um die Klassifikationsleistung an einem konkreten Cutoff zu charakterisieren. Geschäftsrelevant sind ausserdem **Lift@10 %** und **Precision@Top-N %** — diese spiegeln direkt den ökonomischen Nutzen einer priorisierten Kampagnenliste wider und werden im Deliverable-Teil weiter unten ausgewiesen.
+**Sekundäre Metriken.** Zusätzlich werden F1, Precision und Recall bei Default-Threshold 0.5 berichtet, um die Klassifikationsleistung an einem konkreten Cutoff zu charakterisieren. Geschäftsrelevant sind ausserdem **Lift@10 %** und **Precision@Top-N %**, da diese direkt den ökonomischen Nutzen einer priorisierten Kampagnenliste widerspiegeln und im Deliverable-Teil weiter unten ausgewiesen werden.
 
 # Baseline-Modell: Logistische Regression (5 Features)
 
-Die Aufgabenstellung fordert ein Baseline-Modell mit **logistischer Regression** und den Features: Alter, Geschlecht, Region (Durchschnittslohn), Vermögen (letzter Saldo), und Umsatz.
+Die Aufgabenstellung fordert ein Baseline-Modell mit **logistischer Regression** und den Features: Alter, Geschlecht, Region (Durchschnittslohn), Vermögen (letzter Saldo) und Umsatz.
 
 ```{python}
 baseline_cols = feature_sets["baseline"]
@@ -160,7 +156,6 @@ pipe_bl = build_pipeline(
         max_iter=1000,
         random_state=RANDOM_STATE,
     ),
-    feature_cols=baseline_cols,
     scale=True,
 )
 
@@ -210,7 +205,6 @@ pipe_hc = build_pipeline(
         max_iter=1000,
         random_state=RANDOM_STATE,
     ),
-    feature_cols=handcrafted_cols,
     scale=True,
 )
 
@@ -241,9 +235,56 @@ for metric in SCORING_METRICS:
     print(f"  {metric}: {vals.mean():.4f} ± {vals.std():.4f}")
 ```
 
+## Interpretation: Logistische Regressionen (Baseline & Handcrafted)
+
+### Regularisierungsparameter C: ein aufschlussreicher Kontrast
+
+| Modell | Features | Bester C | CV ROC-AUC | CV Avg Precision |
+|---|---|---|---|---|
+| Baseline LogReg | 5 | **100.0** | 0.8872 ± 0.0102 | 0.4664 ± 0.0560 |
+| Handcrafted LogReg | 64 | **0.1** | 0.9090 ± 0.0062 | 0.5471 ± 0.0299 |
+
+**Baseline (C = 100.0, nahezu keine Regularisierung):** Der optimale Wert liegt am oberen Rand des Suchraums `[0.001, …, 100.0]`. Das ist kein Fehler, sondern ein erwartetes Ergebnis: Bei nur 5 Features (p = 5) und 3'111 Trainingssamplen (n = 3'111) stehen pro Feature rund 622 Beobachtungen zur Verfügung, das Modell hat kein Overfitting-Risiko. Die Koeffizienten können sich frei dem verlustminimalen Wert annähern. Ein höheres C (z.B. 1'000) würde die Performance kaum mehr verändern.
+
+**Handcrafted (C = 0.1, moderate Regularisierung):** Mit 64 Features sinkt das n/p-Verhältnis auf ~49, und viele Features (z.B. Quartils-Balance-Features, Halbjahres-Umsätze) sind untereinander korreliert. Der L2-Penalty (C = 0.1 → λ = 10) dämpft diese Multikollinearität und verhindert, dass einzelne stark korrelierende Features extreme Koeffizientenwerte annehmen. Die automatische Wahl von C = 0.1 durch GridSearch zeigt, dass ohne Regularisierung Overfitting auf dem Trainingset eintreten würde.
+
+### Performance-Gewinn durch handgefertigte Features
+
+Der Übergang von 5 zu 64 Features bringt klare Verbesserungen:
+- **ROC-AUC:** +0.0218 (0.8872 → 0.9090)
+- **Average Precision:** +0.0807 (+17.3% relativ), der grösste Gewinn und relevant für die Ziellistengüte
+- **Recall:** +0.0370 (0.8331 → 0.8701), mehr Käufer werden erkannt
+- **Stabilität:** σ sinkt von ±0.0102 auf ±0.0062, für konsistentere Fold-zu-Fold-Performance
+
+Beide Modelle bleiben dennoch klar hinter den Tree-Kandidaten zurück (ROC-AUC ~0.91–0.92), was auf nicht-lineare Feature-Interaktionen hindeutet, die die LogReg nicht abbilden kann.
+
 # Kandidatenmodelle (Tree-basiert)
 
-Drei Ensemble-Modelle mit **allen ~250 Features** (inkl. deduplizierte tsfresh + behavioral + window). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=60). Die Suchräume wurden bewusst breit gewählt, damit das Optimum mit hoher Wahrscheinlichkeit *innerhalb* des Grids liegt — ein Boundary-Check nach jedem Tuning warnt, falls ein bester Parameter am Rand der vorgegebenen Range liegt.
+Drei Ensemble-Modelle mit **allen ~1130 Features** (inkl. deduplizierte tsfresh + behavioral + window). Hyperparameter-Tuning via `RandomizedSearchCV` (n_iter=60). Die Suchräume wurden bewusst breit gewählt, damit das Optimum mit hoher Wahrscheinlichkeit *innerhalb* des Grids liegt. Ein Boundary-Check nach jedem Tuning warnt, falls ein bester Parameter am Rand der vorgegebenen Range liegt.
+
+## Behandlung unbalancierter Daten
+
+Die Zielvariable ist unbalanciert: ~13 % Käufer (Positiv) gegenüber ~87 % Nicht-Käufer (Negativ), ein Verhältnis von ca. **1 : 6.2**. Ohne Gegenmassnahmen tendiert ein Klassifikator dazu, fast alle Beobachtungen als Negativ vorherzusagen. Das maximiert die Accuracy, verfehlt aber den eigentlichen Zweck (Positiv-Recall).
+
+### Gewählter Ansatz: Cost-Sensitive Learning (`class_weight="balanced"`)
+
+Alle Modelle verwenden `class_weight="balanced"` (bzw. `scale_pos_weight` für XGBoost). Dabei wird der Verlust-Beitrag jeder Klasse **invers proportional zu ihrer Häufigkeit** gewichtet, sodass die Minderheitsklasse (Käufer) einen Faktor ≈ 6.2× höheres Gewicht im Verlust erhält. Dadurch lernt das Modell, Käufer stärker zu bevorzugen, ohne die Trainingsdaten zu verändern.
+
+**Vorteile des Ansatzes:**
+- Keine Daten-Artefakte: Die Trainingsverteilung bleibt unverändert; tsfresh-Zeitreihenfeatures werden auf echten, nicht synthetischen Beobachtungen berechnet.
+- Einfache Hyperparameter-Integration: Das Gewicht lässt sich direkt in die sklearn-Pipeline übergeben.
+- Konsistent über alle fünf Modelle: Baseline LogReg, Handcrafted LogReg, RandomForest, HistGBT und XGBoost verwenden denselben Mechanismus, was die CV-Vergleiche fair hält.
+
+### Alternativen und Abwägungen
+
+| Methode | Beschreibung | Warum nicht primär gewählt |
+|---|---|---|
+| **SMOTE** (Oversampling) | Synthetische Minderheits-Samples werden per k-NN-Interpolation erzeugt (`imbalanced-learn`) | Synthetische Samples für hochdimensionale tsfresh-Features sind statistisch fragwürdig; erhöhtes Overfitting-Risiko bei ~1 130 Features |
+| **Random Undersampling** | Mehrheitsklasse auf Minderheitsklasse reduzieren | Verlust von ~87 % der Nicht-Käufer-Daten, was zu starkem Informationsverlust bei ohnehin kleinem Datensatz (3 893 Accounts) führt |
+| **Threshold-Tuning** | Entscheidungsschwelle von 0.5 auf optimalen Wert verschieben | Ergänzend möglich, aber die Modell-Rankings ändern sich nicht; bei Top-N%-Kampagnen ist die Schwelle irrelevant, da nur der Score-Rang zählt |
+| **ADASYN** | Adaptive Version von SMOTE | Gleiche Einwände wie SMOTE, zusätzlich komplexere Hyperparameter |
+
+> **Fazit:** Cost-Sensitive Learning ist für diesen Anwendungsfall die robusteste Wahl. Eine SMOTE-Variante könnte in einem Folge-Experiment auf einem Subset der Features getestet werden, ist aber für das Ranking-Ziel (Top-N%) nicht zwingend notwendig.
 
 ```{python}
 all_cols = feature_sets["all_features"]
@@ -254,27 +295,20 @@ neg_pos_ratio = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
 print(f"scale_pos_weight (neg/pos) = {neg_pos_ratio:.3f}")
 
 # Model configurations
-# Note: GradientBoostingClassifier was removed — it doesn't support n_jobs
-# and is prohibitively slow with ~1576 features (50 iter × 5 folds = 250
-# sequential fits, each with up to 500 trees). HistGradientBoosting is
-# 10-100× faster and achieves comparable or better performance.
-# Die zuvor evaluierte HistGBT-Variante ohne class_weight wurde entfernt:
-# Sie war zur balanced-Variante weitgehend redundant. Stattdessen liefert
-# XGBoost echte Architektur-Diversität (eigenes Boosting, eigene Regularisierung).
 
 candidate_configs = {
     "RandomForest": {
         "model": RandomForestClassifier(
             class_weight="balanced",
             random_state=RANDOM_STATE,
-            n_jobs=-1,
+            n_jobs=1,
         ),
         "params": {
-            "model__n_estimators":    [100, 300, 500, 1000],
-            "model__max_depth":       [5, 10, 20, None],
+            "model__n_estimators": [50, 100, 300, 500, 1000, 2000],
+            "model__max_depth": [3, 4, 5, 10, 20, None],
             "model__min_samples_split": [2, 5, 10],
-            "model__min_samples_leaf":  [1, 2, 5, 10],
-            "model__max_features":      ["sqrt", "log2", 0.1, 0.3],
+            "model__min_samples_leaf": [1, 2, 5, 10],
+            "model__max_features": ["sqrt", "log2", 0.1, 0.3],
         },
         "scale": False,
     },
@@ -284,12 +318,12 @@ candidate_configs = {
             random_state=RANDOM_STATE,
         ),
         "params": {
-            "model__learning_rate":   [0.01, 0.03, 0.05, 0.1, 0.2],
-            "model__max_iter":        [100, 300, 500, 1000, 2000],
-            "model__max_depth":       [3, 5, 7, None],
-            "model__min_samples_leaf": [5, 10, 20, 50],
-            "model__max_leaf_nodes":   [15, 31, 63, None],
-            "model__l2_regularization":[0, 0.1, 1.0, 10.0],
+            "model__learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2, 0.3],
+            "model__max_iter": [10, 20, 50, 100, 300, 500, 1000, 2000],
+            "model__max_depth": [2, 3, 5, 7, None],
+            "model__min_samples_leaf": [1, 2, 5, 10, 20, 50],
+            "model__max_leaf_nodes": [15, 31, 63, None],
+            "model__l2_regularization": [0, 0.1, 1.0, 10.0, 50.0],
         },
         "scale": False,
     },
@@ -298,18 +332,18 @@ candidate_configs = {
             scale_pos_weight=neg_pos_ratio,
             random_state=RANDOM_STATE,
             eval_metric="auc",
-            n_jobs=-1,
+            n_jobs=1,
             tree_method="hist",
         ),
         "params": {
-            "model__n_estimators":     [200, 500, 1000, 2000],
-            "model__learning_rate":    [0.01, 0.03, 0.1, 0.2],
-            "model__max_depth":        [3, 5, 7, 10],
+            "model__n_estimators": [50, 100, 200, 500, 1000, 2000],
+            "model__learning_rate": [0.003, 0.005, 0.01, 0.03, 0.1, 0.2],
+            "model__max_depth": [1, 2, 3, 5, 7, 10, 15],
             "model__min_child_weight": [1, 5, 10],
-            "model__subsample":        [0.6, 0.8, 1.0],
-            "model__colsample_bytree": [0.5, 0.7, 1.0],
-            "model__reg_alpha":        [0, 0.1, 1.0],
-            "model__reg_lambda":       [0.1, 1.0, 10.0],
+            "model__subsample": [0.6, 0.8, 1.0],
+            "model__colsample_bytree": [0.1, 0.2, 0.3, 0.5, 0.7, 1.0],
+            "model__reg_alpha": [0, 0.1, 1.0, 10.0],
+            "model__reg_lambda": [0.01, 0.1, 1.0, 10.0, 30.0, 100.0],
         },
         "scale": False,
     },
@@ -323,7 +357,7 @@ for name, cfg in candidate_configs.items():
     print(f"Tuning: {name}")
     print(f"{'='*60}")
 
-    pipe = build_pipeline(cfg["model"], feature_cols=all_cols, scale=cfg["scale"])
+    pipe = build_pipeline(cfg["model"], scale=cfg["scale"])
 
     search = RandomizedSearchCV(
         pipe,
@@ -351,10 +385,12 @@ for name, cfg in candidate_configs.items():
         for w in warns:
             print(f"    {w}")
     else:
-        print(f"\n  ✓ Keine Boundary-Hits — alle besten Parameter liegen im Inneren der Grid.")
+        print(
+            f"\n  ✓ Keine Boundary-Hits — alle besten Parameter liegen im Inneren der Grid."
+        )
 ```
 
-> **Hinweis zum Boundary-Check:** Wenn Warnungen erscheinen, deuten sie auf einen *suboptimalen Suchraum* hin — das wahre Optimum liegt vermutlich ausserhalb der aktuellen Range. In diesem Fall sollten die betroffenen Parameter-Listen erweitert und das Tuning wiederholt werden. Boundary-Hits sind ein häufiger, aber leicht übersehener Fehler in der Praxis und werden hier explizit erkannt, um die Modellqualität abzusichern.
+> **Hinweis zum Boundary-Check:** Wenn Warnungen erscheinen, deuten sie auf einen *suboptimalen Suchraum* hin, d.h. das wahre Optimum liegt vermutlich ausserhalb der aktuellen Range. In diesem Fall sollten die betroffenen Parameter-Listen passend. Manche Warnungen sind problemlos und können ignoriert werden, nämlich wenn der betroffene Parameter bereits an seinem physikalischen Minimum liegt und eine weitere Reduktion inhaltlich keinen Sinn ergibt. Beispiele: `min_samples_split=2` (kleinstes sinnvolles Split-Kriterium in sklearn) oder `min_child_weight=1` (Minimalwert in XGBoost). Solche Hits zeigen lediglich, dass der Algorithmus den grösstmöglichen Freiheitsgrad bevorzugt, nicht dass der Suchraum erweitert werden muss.
 
 ```{python}
 # Cross-validate each best candidate with all metrics
@@ -418,10 +454,13 @@ for metric in metric_order:
 print("Cross-Validation Ergebnisse (Mean ± Std):")
 # Hauptmetriken (ROC-AUC, AP) farblich hervorheben via background_gradient
 styled = (
-    numeric_means.style
-    .background_gradient(subset=["roc_auc", "average_precision"], cmap="Greens")
+    numeric_means.style.background_gradient(
+        subset=["roc_auc", "average_precision"], cmap="Greens"
+    )
     .format({m: "{:.4f}" for m in metric_order})
-    .set_caption("CV Performance aller Modelle — ROC-AUC und AP als gleichwertige Hauptmetriken")
+    .set_caption(
+        "CV Performance aller Modelle — ROC-AUC und AP als gleichwertige Hauptmetriken"
+    )
 )
 display(styled)
 
@@ -466,8 +505,13 @@ ax.set_title("Cross-Validation Average Precision Vergleich")
 # AP-Skala dynamisch: untere Grenze = Prävalenz (Zufalls-Baseline)
 prevalence = y_train.mean()
 ax.set_xlim(max(0.0, prevalence - 0.05), 1.0)
-ax.axvline(prevalence, color="k", linestyle="--", alpha=0.5,
-           label=f"Prävalenz (Zufall) = {prevalence:.3f}")
+ax.axvline(
+    prevalence,
+    color="k",
+    linestyle="--",
+    alpha=0.5,
+    label=f"Prävalenz (Zufall) = {prevalence:.3f}",
+)
 ax.legend(loc="lower right")
 for bar, val in zip(bars_ap, ap_means):
     ax.text(
@@ -478,12 +522,45 @@ for bar, val in zip(bars_ap, ap_means):
         fontsize=10,
     )
 
-fig.suptitle("CV-Vergleich: ROC-AUC und Average Precision gleichwertig",
-             fontsize=13, fontweight="bold", y=1.02)
+fig.suptitle(
+    "CV-Vergleich: ROC-AUC und Average Precision gleichwertig",
+    fontsize=13,
+    fontweight="bold",
+    y=1.02,
+)
 fig.tight_layout()
 wandb.log({"cv_roc_auc_and_ap_comparison": wandb.Image(fig)})
 plt.show()
 ```
+
+## Interpretation: Cross-Validation Vergleich
+
+### CV-Ranking der Modelle
+
+| Modell | ROC-AUC (CV) | Avg Precision (CV) | F1 (CV) | Stab. (±σ ROC-AUC) |
+|---|---|---|---|---|
+| XGBoost | **0.9153** | **0.5415** | **0.6059** | ±0.0060 |
+| RandomForest | 0.9137 | 0.5368 | 0.5935 | **±0.0042** |
+| HistGBT | 0.9130 | 0.5305 | 0.5959 | ±0.0044 |
+| Handcrafted LogReg | 0.9090 | 0.5471 | 0.5923 | ±0.0062 |
+| Baseline LogReg (5) | 0.8872 | 0.4664 | 0.5520 | ±0.0102 |
+
+### Sind die Unterschiede statistisch signifikant?
+
+**Zwischen den Tree-Modellen: Nein.** Die 1-σ-Bänder überlappen vollständig:
+- XGBoost: [0.9093, 0.9213]
+- RandomForest: [0.9095, 0.9179]
+- HistGBT: [0.9086, 0.9174]
+
+Die Differenz von 0.0023 zwischen XGBoost und HistGBT liegt klar unter einer Standardabweichung. **Kein Tree-Modell zeigt statistisch signifikant überlegene CV-Performance.**
+
+**Auffälligkeit bei HistGBT:** Im CV zeigt HistGBT eine ähnliche F1 (0.5959) wie XGBoost (0.6059) und einen hohen Recall (0.9142). Das beste Modell wählte `max_leaf_nodes=15` und `max_depth=7`.
+
+**Baseline → Handcrafted: Signifikant.** Sprung von 0.8872 → 0.9090 (+0.0218) mit nicht-überlappenden Bändern, der Mehrwert der handgefertigten Features ist statistisch klar belegt.
+
+### Stabilitätsvergleich
+
+RF und HistGBT sind die stabilsten Modelle (σ ≤ 0.0044). XGBoost zeigt die höchste Varianz unter den Tree-Modellen (±0.0060). HistGBT hat zwar höhere Recall-Varianz (±0.0139), aber eine sehr stabile AP (±0.0065).
 
 # Test-Set Evaluation (Deliverable)
 
@@ -563,6 +640,35 @@ wandb.log({"roc_curves": wandb.Image(fig)})
 plt.show()
 ```
 
+## Interpretation: Test-Set Ergebnisse
+
+### Modellranking (Test-Set)
+
+| Modell | ROC-AUC | Avg Precision | F1 | Precision | Recall |
+|---|---|---|---|---|---|
+| XGBoost | **0.9194** | **0.5818** | **0.6044** | **0.4575** | 0.8899 |
+| HistGBT | 0.9177 | 0.5630 | 0.5855 | 0.4280 | **0.9266** |
+| RandomForest | 0.9153 | 0.5472 | 0.5838 | 0.4262 | **0.9266** |
+| Handcrafted LogReg | 0.8965 | 0.5699 | 0.5638 | 0.4167 | 0.8716 |
+| Baseline LogReg (5) | 0.8867 | 0.4875 | 0.5455 | 0.4072 | 0.8257 |
+
+*Zufallserwartung bei Prävalenz 13.9%: ROC-AUC ≈ 0.50, AP ≈ 0.14*
+
+### Wichtigste Erkenntnisse
+
+**XGBoost führt auf ROC-AUC (0.9194)**, dem primären Ranking-Kriterium, und erzielt gleichzeitig die beste Average Precision (0.5818), den besten F1 (0.6044) und die höchste Precision (0.4575). Der Recall ist mit 88.99% etwas niedriger als bei HistGBT und RF.
+
+**HistGBT und RandomForest teilen sich den höchsten Recall (92.66%)**, was bedeutet, dass sie fast alle echten Käufer finden. Dies geht auf Kosten einer etwas niedrigeren Precision (~42-43%). Beide Modelle sind für Volumen-Kampagnen mit niedrigen Kontaktkosten besonders geeignet.
+
+**Bemerkenswerte CV-zu-Test-Diskrepanz bei HistGBT:** Die CV Average Precision (0.5305) liegt unter der Test-AP (0.5630, +0.0325). Bei der Modellselektion ist dies zu beachten.
+
+### Business-Kontext: Kosten von False Positives vs. False Negatives
+
+- **False Positive** (Non-Buyer kontaktiert): Porto + Bearbeitungsaufwand (~geringe Grenzkosten)
+- **False Negative** (Buyer nicht kontaktiert): Entgangener Deckungsbeitrag über Kreditkarten-Laufzeit (erheblich)
+
+**Schlussfolgerung:** Für eine Volumen-Kampagne (Mailing, niedrige Kontaktkosten) bieten sich HistGBT oder RF wegen höchstem Recall (92.66%) an. Für eine selektive Kampagne mit Fokus auf Rankingqualität empfiehlt sich XGBoost wegen höchstem ROC-AUC, AP, F1 und Precision.
+
 ```{python}
 fig = plot_pr_curves(test_results)
 wandb.log({"pr_curves": wandb.Image(fig)})
@@ -574,6 +680,73 @@ plt.show()
 # Top-N% Kundenlisten (Deliverable)
 
 Vergleich der priorisierten Kundenlisten: Welche Kunden würden die verschiedenen Modelle für die Kampagne auswählen? Precision@N zeigt, wie viele der ausgewählten Kunden tatsächlich Käufer sind.
+
+```{python}
+# === Stichproben-Validierung: Fehlklassifikationen auf Account-Ebene ===
+# Aufgabenstellung: Zwischen- und Endergebnisse anhand von Stichproben analysieren.
+# Welche Konten werden falsch klassifiziert? Gibt es systematische Muster?
+
+best_model_name = "XGBoost"
+best_pipe_val = best_candidates[best_model_name].best_estimator_
+
+y_scores_val = best_pipe_val.predict_proba(X_test_all)[:, 1]
+y_pred_val = (y_scores_val >= 0.5).astype(int)
+
+result_df = pd.DataFrame(
+    {
+        "account_id": test_ids,
+        "y_true": y_test.values,
+        "y_pred": y_pred_val,
+        "score": y_scores_val,
+    }
+).reset_index(drop=True)
+
+result_df["result"] = "TN"
+result_df.loc[(result_df.y_true == 1) & (result_df.y_pred == 1), "result"] = "TP"
+result_df.loc[(result_df.y_true == 0) & (result_df.y_pred == 1), "result"] = "FP"
+result_df.loc[(result_df.y_true == 1) & (result_df.y_pred == 0), "result"] = "FN"
+
+print("Confusion Matrix (XGBoost, threshold=0.5):")
+print(result_df["result"].value_counts().rename_axis("Kategorie").to_string())
+
+# Füge wichtigste Features für die Muster-Analyse hinzu
+top_feats = ["balance_last", "balance_mean_q4"]
+available = [f for f in top_feats if f in X_test_all.columns]
+for feat in available:
+    result_df[feat] = X_test_all[feat].values
+
+# False Positives: höchste Modell-Sicherheit, aber falsch
+fps = result_df[result_df.result == "FP"].nlargest(5, "score")
+print("\n--- Top-5 False Positives (höchster Score, aber kein Käufer) ---")
+display_cols = ["account_id", "score"] + available
+print(fps[display_cols].to_string(index=False, float_format="{:.4f}".format))
+
+# False Negatives: verpasste Käufer mit niedrigstem Score
+fns = result_df[result_df.result == "FN"].nsmallest(5, "score")
+print("\n--- Top-5 False Negatives (verpasste Käufer, niedrigster Score) ---")
+print(fns[display_cols].to_string(index=False, float_format="{:.4f}".format))
+
+# Systematische Muster: Durchschnittswerte der Top-Features nach Kategorie
+if available:
+    print("\n--- Ø Feature-Werte nach Vorhersage-Kategorie ---")
+    pattern = result_df.groupby("result")[available].mean().round(0).astype(int)
+    print(pattern.to_string())
+```
+
+### Interpretation: Stichproben-Validierung
+
+Die Fehleranalyse auf Account-Ebene zeigt, **warum** das Modell irrt, und ob die Fehler zufällig oder systematisch sind:
+
+**False Positives (FP), Modell sagt «Käufer» aber kein Kauf:**
+FP-Konten weisen typischerweise einen **höheren Saldo** auf als die durchschnittlichen Nicht-Käufer. Das Modell erkennt sie als «kaufbereit», obwohl sie nicht kauften. Mögliche Erklärungen: Diese Kunden könnten eine Karte bereits anderweitig besitzen, kein Interesse an einer Classic/Gold-Karte haben, oder der beobachtete Zeitraum passt nicht zu ihrem eigentlichen Kaufzeitpunkt.
+
+**False Negatives (FN), Verpasste Käufer:**
+FN-Konten sind echte Käufer, die das Modell übersieht. Diese Kunden haben typischerweise einen **unterdurchschnittlichen Saldo**, sie weichen vom Hauptmuster ab (hoher Saldo → Kreditkarte). Mögliche Erklärungen: Impulskauf trotz mittlerer Vermögenslage, oder Käufer mit starkem Umsatz aber niedrigem absoluten Saldo.
+
+**Systematisches Muster:**
+Der Vergleich der Ø Feature-Werte nach Kategorie zeigt das erwartete Ranking: **TP > FP > FN > TN** für `balance_last` und `balance_mean_q4`. Das Modell ordnet Konten korrekt entlang der Vermögensdimension; Fehler entstehen hauptsächlich in der **Grenzzone** (mittlerer Saldo), wo die Kaufentscheidung von Faktoren abhängt, die im Modell nicht enthalten sind (z.B. Kundenpräferenzen, Beratungsgespräch).
+
+> **Schlussfolgerung:** Die Fehlklassifikationen sind nicht zufällig, sondern konzentrieren sich auf Grenzfälle nahe dem Entscheidungsbereich des Modells. Das ist ein Zeichen von Modellkonsistenz, nicht von Systemversagen.
 
 ```{python}
 for pct in TOP_N_PERCENTILES:
@@ -614,9 +787,85 @@ for pct in TOP_N_PERCENTILES:
     plt.show()
 ```
 
+## Interpretation: Top-N% Kundenlisten & Jaccard-Overlap
+
+### Precision@N — Welches Modell findet die besten Kunden?
+
+| Modell | Precision@Top-5% (39) | Precision@Top-10% (78) |
+|---|---|---|
+| Handcrafted LogReg | **71.8%** (28 Käufer) | 55.1% (43 Käufer) |
+| RandomForest | 61.5% (24 Käufer) | 57.7% (45 Käufer) |
+| HistGBT | 61.5% (24 Käufer) | 57.7% (45 Käufer) |
+| XGBoost | 59.0% (23 Käufer) | **60.3%** (47 Käufer) |
+| Baseline LogReg (5) | 56.4% (22 Käufer) | 51.3% (40 Käufer) |
+
+*Zufallserwartung bei Prävalenz 13.9%: ~5–6 Käufer unter 39 bzw. ~11 unter 78.*
+
+**Bemerkenswerte Rangumkehr:** Handcrafted LogReg dominiert bei Top-5% (71.8%), fällt aber bei Top-10% auf Rang 4 (55.1%). XGBoost ist bei Top-5% das schwächste Tree-Modell (59.0%), gewinnt aber bei Top-10% klar (60.3%). RF und HistGBT teilen sich Rang 2 bei Top-5% (je 61.5%) und Rang 2 bei Top-10% (je 57.7%).
+
+**Kampagnenkonsequenz:** Für eine Premium-Kampagne mit wenigen, hochwertigen Kontakten (Direktgespräch, persönliche Beratung) → Handcrafted LogReg. Für eine Breitenkampagne (Mailing) → XGBoost (beste Top-10% Precision) oder RF/HistGBT (solide Precision@N über beide Schwellen).
+
+### Jaccard-Overlap — Wie konsistent sind die Listen zwischen Modellen?
+
+**Top-5% (39 Accounts):**
+
+| | Baseline | HC LogReg | RF | HistGBT | XGBoost |
+|---|---|---|---|---|---|
+| Baseline | 1.00 | 0.32 | **0.04** | 0.10 | 0.10 |
+| HC LogReg | 0.32 | 1.00 | 0.13 | 0.28 | 0.26 |
+| RF | 0.04 | 0.13 | 1.00 | 0.37 | 0.44 |
+| HistGBT | 0.10 | 0.28 | 0.37 | 1.00 | **0.53** |
+| XGBoost | 0.10 | 0.26 | 0.44 | 0.53 | 1.00 |
+
+**Top-10% (78 Accounts):**
+
+| | Baseline | HC LogReg | RF | HistGBT | XGBoost |
+|---|---|---|---|---|---|
+| Baseline | 1.00 | 0.43 | 0.13 | 0.20 | 0.21 |
+| HC LogReg | 0.43 | 1.00 | 0.33 | 0.34 | 0.39 |
+| RF | 0.13 | 0.33 | 1.00 | **0.68** | **0.68** |
+| HistGBT | 0.20 | 0.34 | 0.68 | 1.00 | **0.68** |
+| XGBoost | 0.21 | 0.39 | 0.68 | 0.68 | 1.00 |
+
+### Wichtigste Erkenntnisse
+
+**1. Tree-Modelle bilden einen stabilen Konsens-Cluster.**
+RF, HistGBT und XGBoost stimmen bei Top-10% zu **68%** überein (Jaccard = 0.68), ein sehr hoher Wert. Kunden, die von allen drei Tree-Modellen ausgewählt werden, sind die robustesten Empfehlungen und sollten mit Priorität kontaktiert werden.
+
+**2. Baseline LogReg ist ein Ausreisser — fast vollständig disjunkte Liste.**
+Der Jaccard von Baseline ↔ RF beträgt bei Top-5% nur **0.04** (nahezu keine Überlappung!). Die Baseline und die Tree-Modelle identifizieren grundlegend verschiedene Kundengruppen. Das liegt daran, dass die Baseline nur 5 grobe Features nutzt und nicht-lineare Muster nicht abbilden kann.
+
+**3. Konsistenz steigt mit Listengrösse.**
+Alle Jaccard-Werte erhöhen sich beim Übergang von Top-5% auf Top-10%. Bei grösseren Listen gibt es mehr Überschneidungen, was bei zunehmender Listengrösse zu erwarten ist.
+
+**4. HistGBT ↔ XGBoost: Höchste Übereinstimmung.**
+Mit Jaccard = 0.53 (Top-5%) und 0.68 (Top-10%) sind diese beiden Gradient-Boosting-Modelle die ähnlichsten im Vergleich, sie empfehlen im Wesentlichen die gleichen Kunden, was durch ihre algorithmische Verwandtschaft erklärbar ist.
+
+### Top-5% vs. Top-10% im Vergleich
+
+Stellt man die beiden Listengrössen direkt gegenüber, zeigen sich klare Unterschiede in Differenz und Konsistenz. Da die Top-5% (39 Kunden) eine Teilmenge der Top-10% (78 Kunden) sind, ist besonders das **zweite Listensegment** aufschlussreich: die zusätzlichen 39 Kunden auf den Rängen 40 bis 78.
+
+| Modell | Precision Top-5% | Precision Top-10% | Diff (Prozentpunkte) | Trefferquote 2. Segment (Rang 40 bis 78) |
+|---|---|---|---|---|
+| Handcrafted LogReg | 71.8% | 55.1% | -16.7 | 38.5% (15/39) |
+| Baseline LogReg (5) | 56.4% | 51.3% | -5.1 | 46.2% (18/39) |
+| RandomForest | 61.5% | 57.7% | -3.8 | 53.8% (21/39) |
+| HistGBT | 61.5% | 57.7% | -3.8 | 53.8% (21/39) |
+| XGBoost | 59.0% | 60.3% | **+1.3** | **61.5% (24/39)** |
+
+**Differenz:** Bei vier der fünf Modelle sinkt die Precision, wenn die Liste von 39 auf 78 Kunden erweitert wird, am stärksten bei Handcrafted LogReg (-16.7 Prozentpunkte). Der Grund liegt im zweiten Segment: Dessen Trefferquote bricht bei Handcrafted auf 38.5% ein, die sichersten Vorhersagen konzentrieren sich also auf eine sehr kleine Spitzengruppe. XGBoost ist die einzige Ausnahme: Sein zweites Segment trifft mit 61.5% sogar besser als das erste (59.0%), weshalb seine Precision bei Top-10% leicht steigt (+1.3 Prozentpunkte). Das erklärt die weiter oben beobachtete Rangumkehr quantitativ.
+
+**Konsistenz:** Die Übereinstimmung zwischen den Modellen wächst mit der Listengrösse. Der durchschnittliche Jaccard-Overlap der drei Tree-Modelle steigt von rund 0.45 (Top-5%) auf 0.68 (Top-10%), also um etwa 0.23. Eine grössere Kontaktliste führt damit nicht nur zu mehr erreichten Käufern, sondern auch zu einer robusteren, modellübergreifend konsenstragenden Auswahl.
+
+**Konsequenz für die Kampagnengrösse:** Wer auf maximale Trefferquote pro Kontakt optimiert (kleines Budget), wählt die Top-5% mit Handcrafted LogReg (71.8%). Wer Reichweite und Robustheit priorisiert, profitiert bei Top-10% von XGBoost, dem einzigen Modell, das ohne Precision-Verlust skaliert.
+
+### Empfehlung für die Kampagne
+
+Kunden, die in der **Schnittmenge aller drei Tree-Modelle** (RF ∩ HistGBT ∩ XGBoost) im Top-10% erscheinen, sind die verlässlichsten Kandidaten: Drei unabhängige Methoden einigen sich auf diese Gruppe, was Overfitting-Risiken einzelner Modelle reduziert.
+
 # Lift Curve (Deliverable)
 
-Die **Lift Curve** zeigt, wie viel besser das Modell im Vergleich zu einer zufälligen Auswahl ist. Ein Lift von 5 bei den Top-10% bedeutet: Das Modell findet 5× mehr Käufer als eine zufällige Auswahl derselben Grösse.
+Die **Lift Curve** zeigt, wie viel besser das Modell im Vergleich zu einer zufälligen Auswahl ist. Ein Lift von 4 bei den Top-10% bedeutet: Das Modell findet 4× mehr Käufer als eine zufällige Auswahl derselben Grösse.
 
 ```{python}
 fig = plot_lift_curve(test_results)
@@ -626,7 +875,7 @@ plt.show()
 
 **Business-Interpretation:**
 
-- **Links im Chart** (wenige Kunden kontaktiert): Hoher Lift — die Modelle identifizieren die vielversprechendsten Kunden sehr gut
+- **Links im Chart** (wenige Kunden kontaktiert): Hoher Lift, die Modelle identifizieren die vielversprechendsten Kunden sehr gut
 - **Cumulative Gains**: Zeigt, welchen Anteil aller Käufer man erreicht, wenn man die Top-X% der priorisierten Liste kontaktiert
 - **Praktischer Nutzen**: Bei einer Kampagnengrösse von 10% aller Kunden können die besten Modelle deutlich mehr Käufer erreichen als eine zufällige Auswahl
 
@@ -637,7 +886,10 @@ Feature Importance zeigt, welche Merkmale die Modelle am stärksten für ihre Vo
 ```{python}
 # Permutation importance for all tree-based candidates (on test set)
 # Using permutation_importance instead of built-in feature_importances_
-# to ensure compatibility with all model types
+# to ensure compatibility with all model types.
+# Results are stored in perm_importances for reuse in Cells 29 and 30.
+perm_importances = {}  # name -> pd.Series(importances_mean, index=feature_cols)
+
 for name, search in best_candidates.items():
     print(f"\nBerechne Permutation Importance für {name}...")
     perm_result = permutation_importance(
@@ -650,6 +902,7 @@ for name, search in best_candidates.items():
         n_jobs=-1,
     )
     imp = pd.Series(perm_result.importances_mean, index=all_cols)
+    perm_importances[name] = imp
     fig = plot_feature_importance(imp, f"{name} (Permutation)")
     fig.tight_layout()
     wandb.log({f"feature_importance_{name}": wandb.Image(fig)})
@@ -657,55 +910,12 @@ for name, search in best_candidates.items():
 ```
 
 ```{python}
-# Permutation Importance for the best model (on test set)
-# Find best model by test ROC-AUC
-best_model_name = max(test_results, key=lambda k: test_results[k]["roc_auc"])
-print(f"Bestes Modell (nach Test ROC-AUC): {best_model_name}")
-
-# Get the corresponding fitted pipeline
-if best_model_name in best_candidates:
-    best_pipe = best_candidates[best_model_name].best_estimator_
-    X_perm = X_test_all
-elif best_model_name == "Handcrafted LogReg":
-    best_pipe = gs_hc.best_estimator_
-    X_perm = X_test_hc
-else:
-    best_pipe = gs_bl.best_estimator_
-    X_perm = X_test_bl
-
-print("Berechne Permutation Importance (n_repeats=10)...")
-perm_result = permutation_importance(
-    best_pipe,
-    X_perm,
-    y_test,
-    scoring=SCORING_PRIMARY,
-    n_repeats=10,
-    random_state=RANDOM_STATE,
-    n_jobs=-1,
-)
-
-perm_imp = pd.Series(perm_result.importances_mean, index=X_perm.columns)
-fig = plot_feature_importance(perm_imp, f"{best_model_name} (Permutation)")
-fig.tight_layout()
-wandb.log({"permutation_importance_best": wandb.Image(fig)})
-plt.show()
-```
-
-```{python}
-# Compare top-20 features across tree models (using permutation importance)
-top_features_all = {}
-for name, search in best_candidates.items():
-    perm_result = permutation_importance(
-        search.best_estimator_,
-        X_test_all,
-        y_test,
-        scoring=SCORING_PRIMARY,
-        n_repeats=10,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-    )
-    imp = pd.Series(perm_result.importances_mean, index=all_cols)
-    top_features_all[name] = imp.nlargest(20).index.tolist()
+# Vergleich der Top-20 Features über alle Tree-Modelle
+top_features_all = {
+    name: imp.nlargest(20).index.tolist()
+    for name, imp in perm_importances.items()
+    if name in best_candidates
+}
 
 if top_features_all:
     print("Top-20 Features pro Modell (Permutation Importance):\n")
@@ -715,25 +925,249 @@ if top_features_all:
     display(top_df)
 ```
 
+```{python}
+# === Feature Importance: Logistische Regression via Koeffizienten ===
+# Für lineare Modelle sind standardisierte Koeffizienten das natürliche
+# Interpretierbarkeits-Werkzeug — keine separate Permutation nötig.
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+# ── Baseline LogReg: alle 5 Features ─────────────────────────────────────────
+coef_bl = gs_bl.best_estimator_.named_steps["model"].coef_[0]
+coef_bl_s = pd.Series(coef_bl, index=baseline_cols).sort_values()
+bar_colors_bl = ["#d73027" if v < 0 else "#1a9850" for v in coef_bl_s]
+axes[0].barh(coef_bl_s.index, coef_bl_s.values, color=bar_colors_bl)
+axes[0].axvline(0, color="black", linewidth=0.8, linestyle="--")
+axes[0].set_xlabel("Standardisierter Koeffizient (L2, C=100)")
+axes[0].set_title("Baseline LogReg\n(5 Features — alle Koeffizienten)")
+
+# ── Handcrafted LogReg: Top-20 nach absolutem Koeffizient ────────────────────
+coef_hc = gs_hc.best_estimator_.named_steps["model"].coef_[0]
+coef_hc_s = pd.Series(coef_hc, index=handcrafted_cols)
+top20_idx = coef_hc_s.abs().nlargest(20).index
+coef_hc_top = coef_hc_s[top20_idx].sort_values()
+bar_colors_hc = ["#d73027" if v < 0 else "#1a9850" for v in coef_hc_top]
+axes[1].barh(coef_hc_top.index, coef_hc_top.values, color=bar_colors_hc)
+axes[1].axvline(0, color="black", linewidth=0.8, linestyle="--")
+axes[1].set_xlabel("Standardisierter Koeffizient (L2, C=0.1)")
+axes[1].set_title("Handcrafted LogReg\nTop-20 nach |Koeffizient|")
+axes[1].tick_params(axis="y", labelsize=8)
+
+fig.suptitle(
+    "Feature Importance: Logistische Regression — Koeffizienten",
+    fontsize=13,
+    fontweight="bold",
+)
+fig.tight_layout()
+wandb.log({"logreg_coefficients": wandb.Image(fig)})
+plt.show()
+
+# Exakte Werte ausgeben
+print("Baseline LogReg — Koeffizienten (absteigend):")
+for feat, val in coef_bl_s.sort_values(ascending=False).items():
+    print(f"  {feat:30s}: {val:+.4f}")
+
+print(f"\nHandcrafted LogReg — Top-20 nach |Koeffizient|:")
+for feat in coef_hc_s.abs().nlargest(20).index:
+    print(f"  {feat:50s}: {coef_hc_s[feat]:+.4f}")
+```
+
+### Interpretation: Logistische Regression, Koeffizienten
+
+**Vorzeichen und Stärke der Koeffizienten** geben für lineare Modelle die Richtung und relative Stärke des Einflusses jedes Features auf die Log-Odds an (nach Standardisierung direkt vergleichbar).
+
+**Baseline LogReg (5 Features):**
+- **`balance_last` dominiert mit Abstand** (+1.79): der letzte erfasste Kontostand ist fast 7× so wichtig wie das zweitstärkste Feature (`turnover`: +0.26). Alle fünf Koeffizienten sind positiv: höheres Vermögen, höherer Umsatz, höheres Durchschnittsgehalt in der Region, höheres Alter und männliches Geschlecht erhöhen allesamt die Kaufwahrscheinlichkeit. `gender` (+0.008) ist praktisch irrelevant.
+
+**Handcrafted LogReg (Top-20 von 64 Features):**
+- **Stärkste positive Prädiktoren:** `balance_mean_q4` (+1.09) und `balance_mean_q1` (+0.78), der durchschnittliche Kontostand im letzten und ersten Quartal dominieren. Konsistent mit Permutation Importance und SHAP.
+- **Stärkste negative Prädiktoren:** `balance_range` (−0.59): hohe Saldo-Schwankungen sind ein Gegenindikator. `pct_op_credit_card_withdrawal` (−0.50): Kunden, die bereits Kreditkarten-Barauszahlungen nutzen, adoptieren seltener eine neue Karte (möglicherweise bereits gesättigt). `pct_ksym_old_age_pension` (−0.43): Rentenempfänger haben geringere Affinität.
+- `avg_credit_amount` (+0.59): Höhere durchschnittliche Gutschriftbeträge signalisieren finanzielle Aktivität → positiver Effekt.
+- `n_active_days` (+0.54): Häufiger aktive Kunden (mehr Tage mit Transaktionen) zeigen höhere Affinität.
+
+**Vergleich mit Tree-Modellen:** Die Koeffizienten der LogReg und die Permutation Importance der Tree-Modelle stimmen im Kern überein (`balance_mean_q4`, `balance_last` an der Spitze). Unterschiede entstehen, weil die LogReg nur lineare Haupteffekte modelliert, während Tree-Modelle Schwellenwert- und Interaktionseffekte erfassen.
+
+## Interpretation: Permutation Importance
+
+### Dominante Features, gemeinsamer Konsens aller drei Tree-Modelle
+
+Alle drei Modelle (RandomForest, HistGBT, XGBoost) führen **`balance_mean_q4` einstimmig auf Rang 1**, und `balance_last` liegt bei allen dreien unter den Top 3:
+
+1. **`balance_mean_q4`**: mittlerer Kontostand im letzten Quartal des Rollup-Fensters (Monate 10–12). Der aktuellste Vermögensstand ist bei allen drei Modellen der stärkste Einzelprädiktor (Rang 1).
+2. **`balance_last`**: letzter erfasster Kontostand. Bei RF und HistGBT auf Rang 2, bei XGBoost auf Rang 3 (dort schiebt sich `tsf_balance__mean` auf Rang 2). Bestätigt: **Kunden mit hohem, stabilem Kontostand sind die primäre Zielgruppe**.
+
+Weitere konsistent hohe Features:
+- **`age_at_event`**: Ältere Kunden nehmen Kreditkarten häufiger an. Bei HistGBT (Rang 3) und XGBoost (Rang 5) klar in den Top 5; bei RandomForest erst auf Rang 9 — dort dominieren die Balance-Quantile die vorderen Ränge.
+- **`tsf_balance__quantile__q_0.1`**: Unteres Balance-Quantil, beschreibt den *schlechtesten Monat* im Rollup-Fenster. Erscheint bei allen drei Modellen in den Top 6 (RF Rang 5, HistGBT Rang 4, XGBoost Rang 6).
+- **`months_to_event`**: Zeitlicher Abstand zum Ereignisdatum. Hoher Wert = älteres Konto zum Rollup-Zeitpunkt, ein indirektes Mass für Kundentreue und Kontoreife. In allen drei Top-20 vertreten (XGBoost Rang 7, HistGBT Rang 11, RF Rang 15).
+
+### Cross-Model-Konsistenz: Hoch im Kern, diversifiziert in der Peripherie
+
+Im Kern sind sich die Modelle einig: `balance_mean_q4` und `balance_last` stehen bei allen drei in den Top 3, dazu kommen `tsf_balance__mean`, `tsf_balance__c3__lag_3` und `age_at_event` als modellübergreifend wiederkehrende Spitzenfeatures. Ab Rang 4–5 divergieren die Modelle: HistGBT gewichtet Transaktions-Timing-Features früh (`tsf_amount__first_location_of_minimum` bereits auf Rang 5, `tsf_amount__agg_linear_trend` auf Rang 6), während XGBoost und RF mehr Balance-Quantile (`q_0.1`, `q_0.3`, `q_0.9`) in den vorderen Rängen führen.
+
+### Überraschungen
+
+- **`age_at_event` rangiert bei RandomForest nur auf Rang 9**, während es bei den Boosting-Modellen (HistGBT Rang 3, XGBoost Rang 5) deutlich höher gewichtet wird. RF verteilt die Importance stärker auf die korrelierten Balance-Quantile.
+- **`gender` und `district_avg_salary`** (Baseline-Features) erscheinen in keinem der Top-20, die Baseline-Features sind schwächere Prädiktoren als die tsfresh-Zeitreihenmerkmale. Auch `district_unemployment_96` taucht in keiner der drei Top-20-Listen auf — regionale Merkmale tragen kaum zur Vorhersage bei.
+- **Handgefertigte Features** (`balance_mean_q4`, `balance_last`, `age_at_event`, `months_to_event`, `n_tx_h1`) belegen trotz nur weniger handgefertigter unter 1130 Features mehrere der obersten Ränge, ein starker Hinweis auf das gute Feature Engineering.
+
+### Interpretation
+
+Das Modell unterscheidet **Käufer primär anhand ihrer finanziellen Stärke und Kontoreife**, nicht anhand von Demografie oder Region. Ein Konto mit hohem, stabilem Saldo und einem Kunden mittleren bis höheren Alters ist das klare Profil der Zielgruppe.
+
+```{python}
+# === XAI Methode 2: SHAP (SHapley Additive exPlanations) ===
+# SHAP erklaert einzelne Vorhersagen durch den fairen Anteil jedes Features
+# an der Abweichung vom Basiswert.
+
+# Bestes Modell (XGBoost) und Preprocessing
+best_pipe_shap = best_candidates[best_model_name].best_estimator_
+
+# Preprocessing ohne Modell anwenden (Imputer-Schritt)
+preprocessor = SKPipeline(best_pipe_shap.steps[:-1])
+X_test_preprocessed = preprocessor.transform(X_test_all)
+X_test_shap = pd.DataFrame(X_test_preprocessed, columns=all_cols)
+
+# Standard TreeExplainer im Log-Odds-Raum (raw output).
+# model_output="probability" wurde entfernt: Es komprimiert alle SHAP-Werte
+# auf winzige Wahrscheinlichkeits-Deltas (~0.001-0.08) und macht den
+# Beeswarm-Plot unlesbar. Log-Odds-Werte zeigen deutlich mehr Spreizung
+# und sind der Standard fuer XGBoost-SHAP-Analysen.
+explainer = shap.TreeExplainer(best_pipe_shap.named_steps["model"])
+shap_values = explainer.shap_values(X_test_shap)
+
+# Bei list-Output (z.B. Multiclass) nur positive Klasse verwenden
+if isinstance(shap_values, list):
+    shap_values = shap_values[1]
+
+
+# Lange tsfresh-Namen fuer die Plot-Anzeige kuerzen (Kopf + Tail bleibt
+# eindeutig). Die Berechnung und Textausgabe nutzen weiter all_cols.
+def short_label(name: str, maxlen: int = 42) -> str:
+    s = name.replace("tsf_", "").replace('"', "").replace("__", "\u00b7")
+    if len(s) <= maxlen:
+        return s
+    return s[: maxlen - 12] + "\u2026" + s[-9:]
+
+
+X_test_shap_display = X_test_shap.copy()
+X_test_shap_display.columns = [short_label(c) for c in all_cols]
+
+# 1. Beeswarm-Plot: Richtung + Magnitude pro Feature
+# Breite via plot_size an SHAP uebergeben (plt.figure(figsize=...) wird von
+# summary_plot ignoriert, da es die Figurbreite intern hart auf 8 Zoll setzt).
+# Kein plt.tight_layout(): es kollidiert mit SHAPs eigener Colorbar.
+shap.summary_plot(
+    shap_values,
+    X_test_shap_display,
+    max_display=20,
+    plot_size=(16, 10),
+    show=False,
+)
+plt.title(
+    f"SHAP Beeswarm ({best_model_name}, Test Set, Top-20 Features)",
+    fontsize=12,
+    fontweight="bold",
+)
+plt.xlabel("SHAP value (Log-Odds Einfluss auf Kaufwahrscheinlichkeit)")
+wandb.log({"shap_beeswarm": wandb.Image(plt.gcf())})
+plt.show()
+
+# 2. Bar-Plot: globale Feature Importance (Mean |SHAP|)
+shap.summary_plot(
+    shap_values,
+    X_test_shap_display,
+    max_display=20,
+    plot_type="bar",
+    plot_size=(14, 9),
+    show=False,
+)
+plt.title(
+    f"SHAP Feature Importance (Mean |SHAP|, Log-Odds) ({best_model_name})",
+    fontsize=12,
+    fontweight="bold",
+)
+wandb.log({"shap_importance_bar": wandb.Image(plt.gcf())})
+plt.show()
+
+# Top-10 SHAP-Werte als Text
+mean_abs_shap = pd.Series(abs(shap_values).mean(axis=0), index=all_cols).nlargest(10)
+print(f"Top-10 Features nach Mean |SHAP| ({best_model_name}):")
+for feat, val in mean_abs_shap.items():
+    print(f"  {feat:55s}: {val:.6f}")
+```
+
+### Interpretation: SHAP (SHapley Additive exPlanations)
+
+#### Methode
+
+SHAP basiert auf spieltheoretischen Shapley-Werten und verteilt den Vorhersagebeitrag eines Modells **fair** auf alle Features. Im Gegensatz zur Permutation Importance liefert SHAP:
+- **Richtung**: Erhöht oder senkt ein Feature die Kaufwahrscheinlichkeit?
+- **Lokalität**: Erklärung auf Ebene einzelner Accounts
+- **Massstab**: Werte im Log-Odds-Raum (Standard `TreeExplainer`) — positiv bedeutet erhöhte, negativ reduzierte Kaufwahrscheinlichkeit
+
+#### Beeswarm-Plot
+
+Jeder Punkt ist ein Account im Test-Set. Horizontale Achse = SHAP-Wert in Log-Odds-Einheiten, Farbe = Feature-Wert (rot = hoch, blau = niedrig). *Im Plot sind die tsfresh-Namen zur besseren Lesbarkeit gekürzt (`tsf_` entfernt, `__` → `·`); im Text unten stehen die vollständigen Namen:*
+
+- **`balance_mean_q4`** (Mean |SHAP| = 0.540): Stärkster Prädiktor. Rote Punkte (hoher Saldo) rechts → hoher Kontostand im letzten Quartal erhöht die Kaufwahrscheinlichkeit klar.
+- **`balance_last`** (0.352) und **`tsf_balance__mean`** (0.235): Weitere Saldo-Features an Rang 2 und 3 — das Muster ist konsistent mit Permutation Importance und LogReg-Koeffizienten.
+- **`tsf_balance__c3__lag_3`** (0.209): Automatisch extrahiertes tsfresh-Feature (Autokorrelation 3. Ordnung des Saldos) — erfasst Muster in der Saldo-Dynamik, die lineare Modelle nicht abbilden.
+- Die Spreizung reicht für die Top-Features von etwa **−0.85 bis +0.4 Log-Odds**. Auffällig ist die **Asymmetrie**: Ein niedriger Saldo (blau) erzeugt einen stärkeren negativen Beitrag (bis −0.8) als ein hoher Saldo (rot) positiven (bis +0.4). Ein niedriger Kontostand spricht also deutlicher *gegen* einen Kauf als ein hoher *dafür*.
+
+#### Top-10 Features nach Mean |SHAP| (Log-Odds-Raum)
+
+| Rang | Feature | Mean \|SHAP\| |
+|---|---|---|
+| 1 | `balance_mean_q4` | 0.5402 |
+| 2 | `balance_last` | 0.3519 |
+| 3 | `tsf_balance__mean` | 0.2347 |
+| 4 | `tsf_balance__c3__lag_3` | 0.2095 |
+| 5 | `tsf_balance__quantile__q_0.3` | 0.1248 |
+| 6 | `tsf_balance__abs_energy` | 0.1198 |
+| 7 | `tsf_balance__quantile__q_0.9` | 0.1095 |
+| 8 | `tsf_balance__quantile__q_0.1` | 0.0865 |
+| 9 | `tsf_balance__index_mass_quantile__q_0.9` | 0.0508 |
+| 10 | `tsf_amount__quantile__q_0.3` | 0.0483 |
+
+#### Mehrwert gegenüber Permutation Importance
+
+| Eigenschaft | Permutation Importance | SHAP |
+|---|---|---|
+| Richtung des Effekts | ✗ | ✓ |
+| Lokale Erklärung (pro Account) | ✗ | ✓ |
+| Massstab (Log-Odds) | ✗ | ✓ |
+| Berücksichtigung von Korrelationen | Bedingt | ✓ |
+
+Beide Methoden stimmen im Kern überein: Balance-Features dominieren. SHAP liefert zusätzlich Richtung und quantitativen Einfluss in Log-Odds-Einheiten.
+
 ## Zielgruppen-Beschreibung für Nicht-Data-Scientists
 
-Basierend auf der Feature-Importance-Analyse können wir das **Profil eines typischen Kreditkarten-Käufers** wie folgt beschreiben:
+Basierend auf der maschinellen Analyse des Kontoverhaltens (SHAP und Permutation Importance des finalen XGBoost-Modells) können wir das **Profil eines typischen Kreditkarten-Käufers** klar und mit konkreten Zahlen beschreiben:
 
 > **Wer kauft eine Kreditkarte?**
 >
-> Die Modelle identifizieren Kunden anhand ihres **Kontoverhaltens in den letzten 12 Monaten** vor dem Kaufzeitpunkt. Die wichtigsten Merkmale sind:
+> Das Modell erkennt potenzielle Käufer anhand ihres **Kontoverhaltens in den letzten 12 Monaten**. Die wichtigsten Merkmale sind:
 >
-> 1. **Kontobewegungen (Transaktionsmuster):** Kunden mit bestimmten Mustern in ihren Kontobewegungen — insbesondere in Bezug auf Salden und Umsätze — sind eher geneigt, eine Kreditkarte zu erwerben. Dies umfasst Variabilität, Trends und Häufigkeit der Transaktionen.
+> 1. **Hoher Kontostand in den letzten drei Monaten** (`balance_mean_q4`): Das stärkste Kaufsignal. Vom Modell korrekt erkannte Käufer haben in diesem Zeitraum einen durchschnittlichen Kontostand von **rund 59'800**, gegenüber nur **rund 27'000** bei den Nicht-Käufern, also etwa das **2.2-fache**. Wer finanziell gut aufgestellt ist, will seine Kaufkraft bequem nutzen.
 >
-> 2. **Vermögen und Umsatz:** Kunden mit höherem letztem Kontostand und/oder höherem Umsatz zeigen eine höhere Affinität.
+> 2. **Hoher aktueller Kontostand** (`balance_last`): Das zweitstärkste Signal. Erkannte Käufer halten zum Analysezeitpunkt im Schnitt **rund 60'300**, Nicht-Käufer nur **rund 25'200**, ein Unterschied vom **2.4-fachen**.
 >
-> 3. **Alter und Geschlecht:** Es gibt erkennbare demografische Muster, wobei bestimmte Altersgruppen und Geschlechter etwas häufiger eine Karte erwerben.
+> 3. **Konstant hohes Transaktionsvolumen über das ganze Jahr** (`tsf_balance__mean`): Käufer sind nicht nur kurzfristig wohlhabend, sondern zeigen über das gesamte Jahr hinweg eine höhere finanzielle Aktivität, dieses Merkmal liegt bei XGBoost unter den Top 3.
 >
-> 4. **Regionale Faktoren:** Der Durchschnittslohn und die wirtschaftliche Situation des Bezirks spielen eine Rolle.
+> 4. **Keine bestehende Kreditkarten-Nutzung:** Kunden, die bereits regelmässig Bargeld über eine Kreditkarte abheben, kaufen seltener eine neue Karte, wahrscheinlich weil sie bereits eine besitzen.
 >
-> **Empfehlung:** Kontaktieren Sie die Top-10% der priorisierten Liste. Diese Gruppe enthält deutlich mehr potenzielle Käufer als eine zufällige Auswahl gleicher Grösse (siehe Lift Curve).
+> 5. **Demographische Faktoren:** Ältere Kunden kaufen etwas häufiger als jüngere (`age_at_event` unter den Top 5). Geschlecht und Region spielen eine sehr untergeordnete Rolle, sie erscheinen in keiner der Top-20-Listen.
+>
+> **Zusammengefasst:** Der ideale Kandidat für ein Kreditkartenangebot ist ein Kunde mit **beständig hohem Kontostand** (rund das 2- bis 2.5-fache eines Nicht-Käufers) und **regelmässiger finanzieller Aktivität** über das gesamte Jahr.
 
-# Zusammenfassung & Empfehlungen
+### Wie gut trifft das Modell? (in Zahlen)
+
+- **Trefferquote der Empfehlung:** Von den **Top-10%** der priorisierten Liste (78 Kunden) sind **60.3% tatsächliche Käufer** (47 von 78), gegenüber nur **13.9%** bei einer zufälligen Auswahl. Das Modell findet damit **~4.3× mehr Käufer** als der Zufall.
+- **Noch schärfer in der Spitze:** In den **Top-5%** (39 Kunden) liegt die Trefferquote je nach Modell bei **59% bis 72%**, also bis zu **5× über** der Zufallsbasis.
+- **Ranking-Qualität:** Mit einem **ROC-AUC von 0.92** ordnet das finale Modell in rund **92 von 100 Fällen** einen echten Käufer korrekt vor einem Nicht-Käufer ein, eine sehr verlässliche Priorisierung für die Kampagne.
+
+**Empfehlung:** Kontaktieren Sie die Top-10% der priorisierten Liste (ca. 78 Kunden). Diese Gruppe enthält gemäss der Modellanalyse ca. **4.3× mehr potenzielle Käufer** als eine zufällige Auswahl gleicher Grösse.
 
 ```{python}
 # Final comparison table
@@ -768,13 +1202,51 @@ display(final_table.style.set_caption("Modellvergleich — Zusammenfassung"))
 wandb.log({"final_comparison": wandb.Table(dataframe=final_table)})
 ```
 
+## Modellselektion
+
+### Entscheidungsgrundlage
+
+Die Modellselektion folgt einer **zweistufigen Priorität**:
+1. **Primär: Test ROC-AUC**, massgebend für die Ranking-Qualität (Top-N% Kampagnenliste)
+2. **Sekundär: Test Average Precision**, Tie-Breaker bei statistisch nicht unterscheidbarem ROC-AUC, da AP bei der Prävalenz von 13.9% stärker auf die Positivklasse fokussiert
+
+### Vergleich der Kandidaten
+
+| Modell | CV ROC-AUC | Test ROC-AUC | Test AP | Test Precision | Test Recall |
+|---|---|---|---|---|---|
+| **XGBoost** | **0.9153** | **0.9194** | **0.5818** | **0.4575** | 0.8899 |
+| HistGBT | 0.9130 | 0.9177 | 0.5630 | 0.4280 | **0.9266** |
+| RandomForest | 0.9137 | 0.9153 | 0.5472 | 0.4262 | **0.9266** |
+
+### Gewähltes Modell: **XGBoost**
+
+**XGBoost wird als finales Modell gewählt**, weil es:
+- Den **höchsten Test ROC-AUC (0.9194)** erzielt, +0.0017 über HistGBT, +0.0041 über RF
+- Den **höchsten CV ROC-AUC (0.9153)** hat, also konsistente Überlegenheit über Kreuzvalidierung *und* Test-Set
+- Die **beste Average Precision (0.5818)**, den besten **F1-Score (0.6044)** und die höchste **Precision (0.4575)** aller Kandidaten aufweist
+
+**HistGBT und RF als Alternative bei Recall-Fokus:** Beide Modelle erzielen mit Recall 92.66% den höchsten Recall (vs. XGBoost 88.99%). Bei einer Volumen-Kampagne mit niedrigen Kontaktkosten, wo das Finden aller Käufer wichtiger ist als Präzision, wären diese Modelle bevorzugt. Zu beachten: Die CV AP von HistGBT (0.5305) liegt 0.0325 unter der Test AP (0.5630).
+
+### Optimale Hyperparameter (XGBoost)
+
+| Parameter | Wert | Begründung |
+|---|---|---|
+| `n_estimators` | 500 | Genügend Iterationen bei kleiner Lernrate |
+| `learning_rate` | 0.005 | Sehr konservatives Lernen, verhindert Overfitting |
+| `max_depth` | 7 | Tiefe Bäume, erfasst komplexe Feature-Interaktionen |
+| `subsample` | 0.8 | Stochastisches Sampling stabilisiert Training |
+| `colsample_bytree` | 0.3 | Stark reduzierte Feature-Auswahl pro Baum, effektive Regularisierung |
+| `min_child_weight` | 10 | Starke Regularisierung auf Blatt-Ebene, verhindert Overfitting |
+| `reg_lambda` | 1.0 | Moderate L2-Regularisierung |
+| `reg_alpha` | 1.0 | Moderate L1-Regularisierung |
+
 ## Business-Empfehlung
 
 **Modellwahl:**
-Das beste Modell nach Test **ROC-AUC** wird für die Kampagne empfohlen — die Anwendung ist ein Ranking-Problem (Top-N% Kontaktliste), und ROC-AUC misst genau diese Ranking-Qualität. Bei einem Patt zwischen zwei Modellen (ROC-AUC-Differenz innerhalb der CV-Standardabweichung) wird die **Average Precision** als Tie-Breaker verwendet, da sie bei der gegebenen Prävalenz von ~13 % stärker auf die Positivklasse fokussiert. Tree-basierte Ensemble-Modelle übertreffen die logistische Regression deutlich, da sie komplexe Interaktionen zwischen den ~250 Features erfassen können.
+Das beste Modell nach Test **ROC-AUC** wird für die Kampagne empfohlen, denn die Anwendung ist ein Ranking-Problem (Top-N% Kontaktliste), und ROC-AUC misst genau diese Ranking-Qualität. Bei einem Patt zwischen zwei Modellen (ROC-AUC-Differenz innerhalb der CV-Standardabweichung) wird die **Average Precision** als Tie-Breaker verwendet, da sie bei der gegebenen Prävalenz von ~13 % stärker auf die Positivklasse fokussiert. Tree-basierte Ensemble-Modelle übertreffen die logistische Regression deutlich, da sie komplexe Interaktionen zwischen den ~1130 Features erfassen können.
 
 **Kampagnengrösse:**
-- **Top-5%** (~39 Kunden): Höchste Precision — ideal für ein begrenztes Budget oder eine Pilot-Kampagne
+- **Top-5%** (~39 Kunden): Höchste Precision, ideal für ein begrenztes Budget oder eine Pilot-Kampagne
 - **Top-10%** (~78 Kunden): Guter Kompromiss zwischen Reichweite und Trefferquote
 - Die Lift Curve zeigt, ab welchem Punkt der Mehrwert gegenüber einer zufälligen Auswahl abnimmt
 
@@ -785,27 +1257,40 @@ Das beste Modell nach Test **ROC-AUC** wird für die Kampagne empfohlen — die 
 
 # AI Tool Disclosure
 
-Im Rahmen dieser Mini-Challenge wurden KI-gestützte Werkzeuge eingesetzt, um den Entwicklungsprozess zu beschleunigen und die Qualität der Ergebnisse zu verbessern.
+Im Rahmen dieser Mini-Challenge wurde das KI-gestützte Werkzeug Claude Code (Anthropic) eingesetzt, um den Entwicklungsprozess zu beschleunigen und die Qualität der Ergebnisse zu sichern.
 
-**Eingesetzte Tools:**
-- **Claude Code (Anthropic):** Ein KI-gestützter Programmierassistent, der im gesamten Projekt als primäres Entwicklungswerkzeug verwendet wurde. Claude Code unterstützte bei der Code-Erstellung, beim Debugging, bei der Architekturplanung und bei der Dokumentation.
+**Eingesetztes Tool:**
+Claude Code (Anthropic) ist ein KI-gestützter Programmierassistent, der im gesamten Projekt als primäres Entwicklungswerkzeug verwendet wurde.
 
 **Einsatzbereiche:**
 
-*Datenverständnis & Studiendesign (Phase 1):* Claude Code half bei der Erstellung des Entity-Relationship-Diagramms, der Validierung von Primär- und Fremdschlüsseln, und bei der Entwicklung des Studiendesigns mit tenure-matched Pseudo-Events für Nicht-Käufer. Die zentrale Designentscheidung — wie man faire Vergleichszeitpunkte für Nicht-Karteninhaber definiert — wurde iterativ mit KI-Unterstützung erarbeitet.
+Claude Code wurde gezielt für drei Aufgaben genutzt:
 
-*Feature Engineering (Phase 2):* Der Aufbau der Feature-Pipeline wurde mit KI-Unterstützung implementiert. Dies umfasste die Integration von tsfresh für automatische Zeitreihen-Feature-Extraktion, die Berechnung der 5 Baseline-Features, und die Erstellung von 22 statischen Features aus Bezirks-, Kredit- und Auftragsdaten. Die Leakage-freie Pipeline-Architektur wurde mit KI-Beratung entworfen.
+1. *Code-Implementierung nach Best Practices:* Die Umsetzung der Datenpipeline, der Feature-Engineering-Schritte und der Modellierung (von der Baseline-Logistik bis zu den Ensemble-Methoden) wurde KI-gestützt nach etablierten Konventionen implementiert (PEP 8, modulare und wiederverwendbare Struktur, leakage-freie Pipelines).
 
-*Predictive Modeling (Phase 3):* Die Modellierung — von der Baseline Logistischen Regression bis zu den Ensemble-Methoden (Random Forest, Gradient Boosting, HistGradient Boosting) — wurde mit KI-Unterstützung implementiert. Hyperparameter-Suchräume, Cross-Validation-Strategie und die Evaluation-Pipeline wurden gemeinsam mit Claude Code entwickelt. Die Visualisierungen (ROC, PR, Lift, Confusion Matrix) und die Feature-Importance-Analyse wurden ebenfalls KI-gestützt erstellt.
+2. *Roter Faden im Notebook:* Claude Code half, eine durchgängige und nachvollziehbare Argumentationslinie über alle Notebook-Phasen herzustellen, sodass Datenverständnis, Feature-Begründung, Modellwahl und Interpretation logisch aufeinander aufbauen.
 
-**Reflexion:**
-Der Einsatz von KI-Tools hat den Entwicklungsprozess erheblich beschleunigt, insbesondere bei repetitiven Aufgaben wie Pipeline-Konstruktion und Visualisierung. Die konzeptionellen Entscheidungen — Studiendesign, Feature-Auswahl, Modellinterpretation — erforderten jedoch weiterhin menschliches Domänenwissen und kritisches Denken. Die KI diente als Beschleuniger, nicht als Ersatz für fachliche Kompetenz.
+3. *Sprachliche Korrektur:* Die Markdown-Texte wurden auf Rechtschreib- und Formulierungsfehler geprüft und bereinigt.
+
+**Prompting-Strategie:**
+
+Zentral war der Einsatz des Plan-Modus von Claude. Statt direkt Code generieren zu lassen, wurde zunächst ein Umsetzungsplan erstellt. Diesen Plan habe ich in den meisten Fällen selbst weiter verfeinert und angepasst, bevor ich ihn von Claude durchlaufen liess. Dieses Vorgehen erzwingt eine bewusste Auseinandersetzung mit dem Lösungsweg, bevor Code entsteht, und verhindert vorschnelle oder unstrukturierte Implementierungen.
+
+Nach der Erstellung eines Plans wurde dieser zusätzlich mit einer zweiten, unabhängigen Claude-Session gegengeprüft (LLM-as-a-Judge). Die zweite Session bewertete den Plan kritisch auf Schwachstellen, Lücken und alternative Ansätze. Dieser Cross-Validation-Schritt zwischen zwei Sessions reduzierte blinde Flecken eines einzelnen Modelllaufs und erhöhte die Verlässlichkeit der getroffenen Entscheidungen.
+
+**Reflexion: erfolgreichste Prompting-Strategie**
+
+Am meisten zum Lösen der Aufgabe trug der Plan-Modus mit anschliessender Verfeinerung und Cross-Validierung bei: Da ich jeden Plan vor der Umsetzung selbst geprüft und angepasst habe, behielt ich die fachliche Kontrolle durchgehend, und die zweite Session als LLM-as-a-Judge deckte Schwachstellen auf, bevor sie in den Code gelangten.
+
+Am meisten zum Kompetenzerwerb trug der direkte Frage-und-Antwort-Austausch bei. Statt mir die nötigen Informationen mühsam aus dem Internet zusammensuchen zu müssen, erhielt ich auf meine Fragen unmittelbar eine Antwort die massgeschneidert ist. Das war eine grosse Hilfe und hat mein Verständnis der Data-Science- und ML-Konzepte spürbar beschleunigt und vertieft. Mir ist bewusst, dass diese Antworten auch falsch sein können; dieses Risiko gehe ich bewusst ein. Bei Unsicherheiten starte ich jeweils selbst eine eigene Recherche oder frage den Dozenten (dich), um die Aussagen zu überprüfen. Gerade dieses kritische Gegenprüfen festigte das Gelernte zusätzlich.
+
+Insgesamt diente mir die KI als Beschleuniger, Strukturgeber und kritischer Diskussionspartner, nicht als Ersatz für mein eigenes Verständnis.
 
 # Quellenverzeichnis
 
 1. Berka, P. (1999). *PKDD'99 Discovery Challenge: Czech Bank Financial Dataset.* Prague University of Economics.
 2. Pedregosa, F. et al. (2011). *Scikit-learn: Machine Learning in Python.* JMLR 12, pp. 2825–2830.
-3. Christ, M. et al. (2018). *Time Series FeatuRe Extraction on basis of Scalable Hypothesis tests (tsfresh — A Python package).* Neurocomputing 307, pp. 72–77.
+3. Christ, M. et al. (2018). *Time Series FeatuRe Extraction on basis of Scalable Hypothesis tests (tsfresh - A Python package).* Neurocomputing 307, pp. 72–77.
 4. Fawcett, T. (2006). *An introduction to ROC analysis.* Pattern Recognition Letters 27(8), pp. 861–874.
 5. Davis, J. & Goadrich, M. (2006). *The Relationship Between Precision-Recall and ROC Curves.* Proceedings of the 23rd International Conference on Machine Learning (ICML).
 6. Anthropic. (2025). *Claude Code.* https://claude.ai/code

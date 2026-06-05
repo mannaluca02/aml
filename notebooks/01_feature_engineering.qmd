@@ -1,7 +1,7 @@
 ---
 title: 'AML - Phase 2: Feature Engineering'
 author: Luca Manna
-date: '2026-03-14'
+date: 2026-06-5
 format:
   html:
     toc: true
@@ -12,16 +12,8 @@ lang: de
 jupyter: python3
 ---
 
-In dieser Phase wird der **Client Analytical Record** erstellt — eine Zeile pro Konto mit allen prädiktiven Features. Grundlage ist die `study_table` aus Phase 1, die für jedes Konto das Rollup-Zeitfenster `[rollup_start, rollup_end]`, das Target-Label und den Train/Test-Split definiert.
-
-**Feature-Kategorien:**
-1. **tsfresh (automatisch):** ~1'500 Features aus Transaktions-Zeitreihen (Betrag & Saldo) via `EfficientFCParameters`, reduziert auf ~100-200 durch Korrelations-Deduplizierung
-2. **Baseline (5 Features):** Alter, Geschlecht, Region, Vermögen, Umsatz — gemäss Aufgabenstellung
-3. **Statische Features (20):** Bezirk, Kredit, Daueraufträge, Kontofrequenz
-4. **Behavioral Features (30):** Transaktionstyp-Ratios, Operationsmuster, Verwendungszweck, Aktivitätsmetriken
-5. **Window Features (12):** Temporale Sub-Fenster-Vergleiche (Quartal-/Halbjahrestrends, monatliche Steigung)
-
 ```{python}
+import os
 import sys
 import time
 
@@ -29,33 +21,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from tsfresh import select_features
 
 # Add project root to path so we can import src
 sys.path.insert(0, "..")
 
 from src.data import (
+    PATH_PROCESSED,
+    RANDOM_STATE,
     load_raw_data,
     load_study_table,
     set_plot_style,
-    RANDOM_STATE,
-    ROLLUP_MONTHS,
-    LAG_MONTHS,
-    TOTAL_HISTORY_MONTHS,
-    PATH_PROCESSED,
 )
 from src.features import (
-    filter_transactions_to_rollup,
-    compute_tsfresh_features,
-    compute_baseline_features,
-    compute_static_features,
-    compute_behavioral_features,
-    compute_window_comparison_features,
-    build_feature_matrix,
-    get_feature_overview_table,
     BASELINE_FEATURE_COLS,
     BEHAVIORAL_FEATURE_COLS,
-    WINDOW_FEATURE_COLS,
     TSFRESH_FEATURE_PREFIX,
+    WINDOW_FEATURE_COLS,
+    build_feature_matrix,
+    compute_baseline_features,
+    compute_behavioral_features,
+    compute_static_features,
+    compute_tsfresh_features,
+    compute_window_comparison_features,
+    filter_transactions_to_rollup,
+    get_feature_overview_table,
 )
 
 set_plot_style()
@@ -91,8 +81,8 @@ Raw Tables (8 CSVs)
     │
     ├── trans (1M+ rows) ──► Rollup Filter [rollup_start, rollup_end] ──► trans_rollup (~280K rows)
     │                              │
-    │                              ├── tsfresh EfficientFCParameters ──► ~1'500 auto Features (amount + balance)
-    │                              │       └── Correlation Dedup ──► ~100-200 unique tsfresh Features
+    │                              ├── tsfresh EfficientFCParameters ──► ~1'554 auto Features (amount + balance)
+    │                              │       └── Correlation Dedup ──► 1'066 unique tsfresh Features
     │                              ├── Baseline Aggregation ──► balance_last, turnover
     │                              ├── Behavioral Features ──► 30 Features (type, operation, k_symbol, bank, ratios)
     │                              └── Window Comparison ──► 12 Features (Q1-Q4, H1-H2 trends, monthly slope)
@@ -104,13 +94,13 @@ Raw Tables (8 CSVs)
     └── account ──► frequency one-hot, months_to_event
                               │
                               ▼
-                    Feature Matrix (1 row per account, ~250 features)
+                    Feature Matrix (1 row per account, ~1'130 features)
 ```
 
 **Neue Feature-Gruppen (Phase 3.1):**
 - **Behavioral (30):** Transaktionstyp-Ratios (`type`), Operationsmuster (`operation`), Verwendungszweck (`k_symbol`), Aktivitätsmetriken, abgeleitete Verhältnisse
 - **Window (12):** Quartal- und Halbjahresvergleiche innerhalb des 12-Monats-Fensters (Balance-Trend Q1→Q4, Umsatz-Trend H1→H2, monatliche Balance-Steigung)
-- **tsfresh Dedup:** Greedy-Selektion nach Target-Korrelation mit Pearson-Schwelle 0.95 reduziert ~1'500 auf ~100-200 Features
+- **tsfresh Dedup:** Greedy-Selektion nach Target-Korrelation mit Pearson-Schwelle 0.95 reduziert 1'554 auf 1'066 Features
 
 **Leakage Guards:**
 - Transaktionen strikt auf `[rollup_start, rollup_end]` gefiltert (kein Lag-Zeitraum, keine Post-Event-Daten)
@@ -166,9 +156,9 @@ print(f"\nBeispiel-Features (erste 10 Spalten):")
 print(tsfresh_features.iloc[:3, :10].to_string())
 ```
 
-```{python}
-# === tsfresh Feature-Analyse ===
+### tsfresh Feature-Analyse
 
+```{python}
 # NaN-Anteil nach Imputation (sollte 0 sein)
 nan_counts = tsfresh_features.isna().sum()
 nan_nonzero = nan_counts[nan_counts > 0]
@@ -212,7 +202,7 @@ plt.show()
 
 **Korrelationsheatmap (links):** Die Top-20 Features (nach Varianz) zeigen deutliche Korrelationsblöcke. Mehrere Feature-Gruppen sind stark positiv korreliert (gelbe Blöcke, r > 0.75), was auf redundante Information hindeutet — z.B. sind `abs_energy`, `sum_values` und `mean` einer Zeitreihe mathematisch eng verwandt. Gleichzeitig gibt es negativ korrelierte Paare (dunkle Zellen), die komplementäre Informationen liefern. Diese hohe Multikollinearität unter den Top-Varianz-Features ist für baumbasierte Modelle unkritisch, könnte aber bei linearen Modellen zu Instabilität führen.
 
-**Varianzverteilung (rechts):** Die log10-Verteilung der Feature-Varianzen erstreckt sich über ~40 Grössenordnungen (von 10⁻¹⁰ bis 10³⁰). Der deutliche Peak bei ~10⁸ entspricht Features wie `abs_energy` und `sum_values`, deren Werte im Millionenbereich liegen. Der zweite Häufungspunkt bei ~10⁻⁵ zeigt normalisierte Features (Autokorrelationen, Entropien). **323 Features (21%) haben exakt Null-Varianz** und sind damit konstant über alle Konten — diese tragen keine prädiktive Information und werden durch `select_features()` eliminiert.
+**Varianzverteilung (rechts):** Die log10-Verteilung der Feature-Varianzen erstreckt sich über ~40 Grössenordnungen (von 10⁻¹⁰ bis 10³⁰). Der deutliche Peak bei ~10⁸ entspricht Features wie `abs_energy` und `sum_values`, deren Werte im Millionenbereich liegen. Der zweite Häufungspunkt bei ~10⁻³ zeigt normalisierte Features (Autokorrelationen, Entropien). **323 Features (21%) haben exakt Null-Varianz** und sind damit konstant über alle Konten — diese tragen keine prädiktive Information und werden durch `select_features()` eliminiert.
 
 ## Baseline Features
 
@@ -256,11 +246,11 @@ Die deskriptiven Statistiken zeigen plausible Wertebereiche:
 
 - **age_at_event:** Durchschnitt 45.5 Jahre (Std 16.2), Spanne 17–81. Die breite Altersverteilung bietet gutes Diskriminierungspotenzial.
 - **gender:** Nahezu ausgeglichen (51% männlich). Kein Geschlechter-Bias in der Stichprobe.
-- **district_avg_salary:** Durchschnitt 9'511 CZK (Std 1'321). Relativ geringe Streuung — die meisten Bezirke liegen im Bereich 8'100–12'500.
+- **district_avg_salary:** Durchschnitt 9'511 CZK (Std 1'321). Relativ geringe Streuung. Die meisten Bezirke liegen im Bereich 8'100–12'500.
 - **balance_last:** Durchschnitt 34'025 CZK mit hoher Streuung (Std 19'153). Minimum negativ (-10'605 CZK), was auf überziehbare Konten hindeutet. Rechtsschief verteilt.
 - **turnover:** Durchschnitt 405'363 CZK, stark rechtsschief (Std 339'950). Einzelne Konten haben einen Umsatz von über 2 Mio. CZK.
 
-**Spot-Check:** Konto #14 (Vermögen 35'600, Umsatz 383K) und Konto #18 (Vermögen 39'294, Umsatz 1.14M) zeigen deutlich unterschiedliche Umsatzniveaus bei ähnlichem Vermögen — Konto #18 hat einen ~3× höheren Umsatz, was auf intensivere Kontonutzung hindeutet. Beide Werte sind konsistent mit den Zeitreihenplots aus Phase 1. Zu beachten: 2 Konten haben keine Transaktionen im Rollup-Fenster (NaN für `balance_last` und `turnover`).
+**Spot-Check:** Konto #14 (Vermögen 35'600, Umsatz 383K) und Konto #18 (Vermögen 39'294, Umsatz 1.14M) zeigen deutlich unterschiedliche Umsatzniveaus bei ähnlichem Vermögen. Konto #18 hat einen ~3× höheren Umsatz, was auf intensivere Kontonutzung hindeutet. Beide Werte sind konsistent mit den Zeitreihenplots aus Phase 1. Zu beachten: 2 Konten haben keine Transaktionen im Rollup-Fenster (NaN für `balance_last` und `turnover`).
 
 ## Statische Features
 
@@ -282,6 +272,9 @@ print("\n--- Stichprobe (5 zufällige Konten) ---")
 sample = static_features.sample(5, random_state=RANDOM_STATE)
 print(sample.to_string(index=False))
 ```
+
+### Erkentnisse
+Die 20 statischen Features lassen sich in vier Gruppen einteilen: persönliche Merkmale (`age_at_event`, `gender`), regionale Merkmale (`district_*`), Produktnutzung (`loan_*`, `has_loan`, `order_*`) und Kontoverhalten (`freq_*`, `months_to_event`). Da nur rund 15% der Konten einen Kredit besitzen, weisen `loan_amount` und `loan_monthly_payment` für die Mehrheit den Wert 0 auf. Dies ist eine strukturelle Sparsity, die durch `has_loan` als Indikatorvariable explizit abgebildet wird. Der Feature `months_to_event` kodiert das Ergebnis der Tenure-Matching-Zuweisung und ermöglicht es dem Modell, Kontoalterseffekte zu kontrollieren.
 
 ## Behavioral Features (30)
 
@@ -360,6 +353,10 @@ plt.tight_layout()
 plt.show()
 ```
 
+### Erkenntnisse
+
+Die Verteilungen nach Target zeigen für die meisten Behavioral Features nahezu deckungsgleiche Histogramme für Käufer und Nicht-Käufer. Am stärksten unterscheidet sich `n_distinct_ksymbols`: Käufer nutzen tendenziell mehr verschiedene Transaktionskategorien (Peak bei ~4), was auf eine breitere Produktnutzung hindeutet. Auch `avg_credit_amount` weist bei Käufern einen schwereren rechten Schwanz auf, was auf höhere durchschnittliche Einzahlungsbeträge hindeutet. Die `pct_op_*` Features weisen strukturelle Nullhäufungen auf, da viele Konten einzelne Operationstypen im Beobachtungszeitraum gar nicht genutzt haben. Insgesamt bestätigen die Behavioral Features den Befund aus der EDA: Die Trennung auf Basis einzelner Features ist schwach, und das Modell wird auf das Zusammenspiel mehrerer Features angewiesen sein.
+
 ## Window Comparison Features (12)
 
 Temporale Sub-Fenster innerhalb des 12-Monats-Rollup: Vergleicht Kontoverhalten zwischen Quartalen (Q1=älteste 3 Monate, Q4=neueste 3 Monate) und Halbjahren (H1/H2). Erlaubt die Erfassung von **Trends** wie "Saldo wächst" oder "Umsatz beschleunigt sich".
@@ -414,6 +411,28 @@ plt.suptitle(
 plt.tight_layout()
 plt.show()
 ```
+
+### Interpretation: Window Comparison Features
+
+#### Deskriptive Statistik
+
+Die 12 Window Features beschreiben Trends und absolute Niveaus innerhalb des 12-Monats-Rollup-Fensters:
+
+- **Kontostandniveau:** `balance_mean_q1` (Ø 34'615 CZK) und `balance_mean_q4` (Ø 35'527 CZK) liegen nahe beieinander — die meisten Konten zeigen über das Jahr hinweg einen stabilen Saldo. Der Median des prozentualen Trends (`balance_trend_q1_q4_pct`) liegt bei nur 3%, was bestätigt, dass kurzfristige Saldobewegungen gering sind.
+
+- **Umsatzentwicklung:** `turnover_h2` (Ø 205'535 CZK) ist leicht höher als `turnover_h1` (Ø 199'620 CZK). Der Median des Umsatztrends liegt bei 2% — kaum systematisches Wachstum, aber einzelne Ausreisser treiben den Mittelwert auf 28%. Die hohe Standardabweichung (~111'000 CZK) zeigt starke Heterogenität zwischen Konten.
+
+- **Transaktionshäufigkeit:** `n_tx_h2` (Ø 37.6) > `n_tx_h1` (Ø 34.1) — in der zweiten Jahreshälfte werden im Schnitt 10% mehr Transaktionen durchgeführt. Der Trend `tx_count_trend_h1_h2` hat einen Mittelwert von +3.45 Transaktionen.
+
+- **Monatlicher Saldobegriff (`monthly_balance_slope`):** Median = +97 CZK/Monat, Mittelwert = +105 CZK/Monat — die grosse Mehrheit der Konten zeigt eine leicht positive Saldobewegung. Die Streuung ist jedoch sehr gross (Std = 1'408 CZK), mit Extremwerten von −8'388 bis +7'559 CZK/Monat.
+
+#### Verteilungen nach Target
+
+Die Histogramme zeigen für alle sechs dargestellten Trend-Features eine **starke Überlappung der Buyer- und Non-Buyer-Verteilungen**. Keines der Trend-Features allein trennt die Klassen klar. Das ist ein wichtiger Befund:
+
+> **Nicht der Trend, sondern das absolute Niveau entscheidet.** Die Permutation-Importance-Analyse (Phase 3) bestätigt dies: `balance_mean_q4` (absoluter Saldo im letzten Quartal) ist das stärkste Feature, während Trend-Features wie `balance_trend_q1_q4` und `monthly_balance_slope` weiter hinten ranken.
+
+Die Window Features leisten dennoch einen Beitrag: Für nicht-lineare Modelle (Tree-Ensembles) können sie in Kombination mit anderen Features Interaktionseffekte erfassen — z.B. "hohes Niveau UND steigender Trend" als besonders starkes Signal.
 
 ## Übersicht aller handgefertigten Features
 
@@ -500,7 +519,7 @@ Zusätzlich zu den 64 handgefertigten Features extrahiert `tsfresh` aus den Zeit
 | Trend | `linear_trend`, `agg_linear_trend` | Drift im Saldo/Umsatz |
 | Sonstige | `benford_correlation`, `abs_energy`, `count_above_mean` | diverse Detektoren |
 
-tsfresh extrahiert mit `EfficientFCParameters` ~777 Features pro Zeitreihe (`amount` + `balance` = ~1'554 total), reduziert via Korrelations-Deduplizierung (Schwelle 0.95) auf ~100-200 prädiktiv-relevante Spalten. Die finale Selektion bleibt deutlich kleiner und überlappungsfrei, sodass die handgefertigten Features mit klarer Domänen-Interpretation und die tsfresh-Features mit statistischer Breite einander ergänzen.
+tsfresh extrahiert mit `EfficientFCParameters` ~777 Features pro Zeitreihe (`amount` + `balance` = ~1'554 total), reduziert via Korrelations-Deduplizierung (Schwelle 0.95) auf 1'066 nicht-redundante Spalten. Diese ergänzen die 64 handgefertigten Features mit klarer Domänen-Interpretation um eine breite statistische Abdeckung der Zeitreihen-Dynamik.
 
 Die exakten Definitionen aller Features finden sich in `src/features.py` (Funktionen `compute_baseline_features`, `compute_static_features`, `compute_behavioral_features`, `compute_window_comparison_features`).
 
@@ -567,6 +586,40 @@ print(f"  davon Käufer (Target=1):     {(feature_matrix['target'] == 1).sum()}"
 print(f"  davon Nicht-Käufer (Target=0): {(feature_matrix['target'] == 0).sum()}")
 ```
 
+### Interpretation: Feature-Matrix Assembly & Deliverables
+
+#### Feature Matrix (3'893 × 1'133)
+
+Die finale Feature Matrix enthält **3'893 Accounts** mit **1'130 Prädiktoren** und 3 Metadaten-Spalten (`account_id`, `target`, `split`). Sie setzt sich zusammen aus:
+
+| Kategorie | Anzahl | Anteil |
+|---|---|---|
+| tsfresh (automatisch) | 1'066 | 94.3% |
+| Behavioral (handgefertigt) | 30 | 2.7% |
+| Window Comparison (handgefertigt) | 12 | 1.1% |
+| Baseline | 5 | 0.4% |
+| District | 5 | 0.4% |
+| Account | 4 | 0.4% |
+| Loan | 4 | 0.4% |
+| Order | 4 | 0.4% |
+| **Total handgefertigt** | **64** | **5.7%** |
+
+Die tsfresh-Extraktion startete mit 1'554 Features, reduzierte durch Deduplizierung (Korrelation > 0.95) auf **1'066** — ein Drittel der Features war redundant. Von den ursprünglichen 1'056'320 Transaktionen verblieben nach Rollup-Filterung **279'226** (26.4%) für die Feature-Berechnung.
+
+#### Klassen-Ungleichgewicht & Split (Deliverable)
+
+| | Test | Train | Gesamt |
+|---|---|---|---|
+| Käufer (1) | 109 | 431 | **540** |
+| Nicht-Käufer (0) | 673 | 2'680 | **3'353** |
+| **Total** | **782** | **3'111** | **3'893** |
+
+**Prävalenz: 13.9%** — auf je ~7 Konten kommt 1 Käufer. Der stratifizierte Split bewahrt diese Verteilung exakt in beiden Partitionen (Train: 431/3'111 = 13.9%, Test: 109/782 = 13.9%).
+
+**Datenreduktion:** Von den ursprünglich 4'500 Konten haben 3'893 (86.5%) ein vollständiges 12-Monats-Rollup-Fenster. Die 607 ausgeschlossenen Konten hatten zu kurze Transaktionshistorien — ein erwartbarer Verlust bei einem historischen Datensatz.
+
+**Klassen-Ungleichgewicht (Ratio 1:6.2)** ist moderat für einen Marketing-Datensatz. Die Verwendung von `class_weight="balanced"` in allen Modellen kompensiert dieses Ungleichgewicht durch implizite Upweighting der Minority-Class beim Training.
+
 ```{python}
 # === Feature-Verteilungen nach Target (Baseline Features) ===
 
@@ -614,13 +667,15 @@ plt.show()
 Die Histogramme zeigen die Verteilung der Baseline-Features getrennt nach Käufern (Target=1) und Nicht-Käufern (Target=0):
 
 - **age_at_event:** Nicht-Käufer zeigen eine relativ gleichmässige Altersverteilung über alle Altersgruppen. Käufer hingegen konzentrieren sich stärker im Bereich 25–55 Jahre, mit einem deutlichen Rückgang bei Senioren (65+). Jüngere und mittelalte Kunden scheinen empfänglicher für Kreditkarten zu sein.
-- **gender:** Die Geschlechterverteilung ist in beiden Gruppen nahezu identisch — Geschlecht allein ist kein starker Prädiktor für Kreditkarten-Affinität.
+- **gender:** Die Geschlechterverteilung ist in beiden Gruppen nahezu identisch. Geschlecht allein ist kein starker Prädiktor für Kreditkarten-Affinität.
 - **district_avg_salary:** Beide Gruppen haben eine ähnliche Verteilung, wobei Käufer eine leichte Tendenz zu höheren Durchschnittsgehältern zeigen (mehr Masse im rechten Bereich >10'000 CZK). Der Effekt ist aber subtil.
 - **balance_last:** Beide Gruppen sind rechtsschief verteilt. Käufer zeigen tendenziell etwas höhere Kontostände, aber die Verteilungen überlappen stark. Das Vermögen allein reicht nicht zur Unterscheidung.
 - **turnover:** Stark rechtsschief in beiden Gruppen. Käufer haben tendenziell einen etwas höheren Umsatz, aber auch hier gibt es grosse Überlappung. Die langen rechten Ausläufer deuten auf einige Konten mit sehr hohem Transaktionsvolumen hin.
-- **has_loan:** Käufer haben einen deutlich höheren Anteil an Kreditnehmern als Nicht-Käufer. Dies ist einer der stärksten univariaten Unterschiede — Kunden mit bestehendem Kredit sind eher bereit, auch eine Kreditkarte zu akzeptieren.
+- **has_loan:** Käufer haben einen deutlich höheren Anteil an Kreditnehmern als Nicht-Käufer. Dies ist einer der stärksten univariaten Unterschiede. Kunden mit bestehendem Kredit sind eher bereit, auch eine Kreditkarte zu akzeptieren.
 
-**Fazit:** Kein einzelnes Baseline-Feature trennt die Gruppen vollständig — die Verteilungen überlappen erheblich. Die stärksten univariaten Signale kommen von `has_loan` und `age_at_event`. Für eine gute Klassifikation werden die Interaktionen zwischen Features und die tsfresh-Zeitreihenfeatures entscheidend sein.
+**Fazit:** Kein einzelnes Baseline-Feature trennt die Gruppen vollständig. Die Verteilungen überlappen erheblich. Die stärksten univariaten Signale kommen von `has_loan` und `age_at_event`. Für eine gute Klassifikation werden die Interaktionen zwischen Features und die tsfresh-Zeitreihenfeatures entscheidend sein.
+
+## Korrelationsmatrix der handgefertigten Features
 
 ```{python}
 # === Korrelationsmatrix der handgefertigten Features ===
@@ -632,50 +687,56 @@ hand_crafted_cols = [
     and not c.startswith(TSFRESH_FEATURE_PREFIX)
 ]
 
-corr = feature_matrix[hand_crafted_cols].corr()
+corr_full = feature_matrix[hand_crafted_cols].corr()
 
-fig, ax = plt.subplots(figsize=(12, 10))
+# Nur Features behalten, die mit mindestens einem anderen Feature |r| > 0.3 haben
+mask_diag = np.eye(len(corr_full), dtype=bool)
+has_strong_corr = corr_full.abs().where(~mask_diag).max(axis=1) > 0.3
+selected_cols = corr_full.columns[has_strong_corr].tolist()
+corr = corr_full.loc[selected_cols, selected_cols]
+
+fig, ax = plt.subplots(figsize=(16, 14))
 mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
 sns.heatmap(
     corr,
     mask=mask,
-    annot=True,
-    fmt=".2f",
-    cmap="viridis",
+    annot=False,
+    cmap="RdBu_r",
     center=0,
     vmin=-1,
     vmax=1,
     ax=ax,
     square=True,
-    annot_kws={"size": 8},
+    linewidths=0.3,
+    linecolor="white",
 )
-ax.set_title("Korrelationsmatrix der handgefertigten Features")
+ax.set_title(
+    f"Korrelationsmatrix der handgefertigten Features (|r| > 0.3, n={len(selected_cols)})"
+)
+ax.tick_params(axis="x", labelsize=9, rotation=90)
+ax.tick_params(axis="y", labelsize=9, rotation=0)
 plt.tight_layout()
 plt.show()
 ```
 
 ### Interpretation: Korrelationsmatrix
 
-Die Heatmap zeigt die paarweisen Pearson-Korrelationen aller 22 handgefertigten Features. Auffällige Muster:
+Die gefilterte Heatmap zeigt 59 von ~64 handgefertigten Features, die mit mindestens einem anderen Feature eine Korrelation von |r| > 0.3 aufweisen. Vier Korrelationsblöcke sind klar erkennbar:
 
-**Starke positive Korrelationen (r > 0.7):**
-- **Bezirks-Features** bilden einen hochkorrelierten Block: `district_inhabitants`, `district_crimes_96`, `district_urban_ratio` und `district_avg_salary` korrelieren stark untereinander (r = 0.76–0.99). Grosse, urbane Bezirke haben gleichzeitig mehr Einwohner, höhere Gehälter und mehr Kriminalität. Diese Redundanz ist bei der Feature Selection zu beachten.
-- **Kredit-Features:** `has_loan`, `loan_amount`, `loan_monthly_payment` und `has_loan_order` sind erwartungsgemäss stark korreliert (r = 0.76–0.89), da sie alle vom Vorhandensein eines Kredits abhängen.
-- **`balance_last` ↔ `turnover`** (r = 0.54): Moderater Zusammenhang — Konten mit höherem Saldo haben tendenziell auch höheren Umsatz.
+**Bezirks-Block:** `district_avg_salary`, `district_unemployment_96`, `district_urban_ratio`, `district_inhabitants`, `district_entrepreneurs` und `district_crimes_96` bilden einen stark positiv korrelierten Block. Grosse, urbane Bezirke haben gleichzeitig höhere Gehälter, mehr Einwohner und mehr Kriminalität. Da diese Features weitgehend dieselbe regionale Information tragen, ist für das Baseline-Modell ein einziger Vertreter (z.B. `district_avg_salary`) ausreichend.
 
-**Negative Korrelationen:**
-- **`freq_monthly` ↔ `freq_weekly`** (r = -0.83): Erwartetes Artefakt der One-Hot-Kodierung — ein Konto kann nur eine Frequenz haben.
-- **`district_urban_ratio` ↔ `district_entrepreneurs`** (r = -0.72): In urbanen Bezirken gibt es anteilig weniger Unternehmer.
+**Kredit-Block:** `loan_amount`, `loan_monthly_payment` und `has_loan` sind erwartungsgemäss stark korreliert, da `loan_amount` und `loan_monthly_payment` nur für Konten mit aktivem Kredit von null verschieden sind.
 
-**Geringe Korrelationen:**
-- `gender` zeigt nahezu keine Korrelation mit anderen Features (alle |r| < 0.12), was die geringe prädiktive Kraft bestätigt.
-- `months_to_event` ist weitgehend unabhängig von allen anderen Features.
+**Betrags-Block:** `avg_amount`, `std_amount`, `median_amount`, `balance_range` und `turnover_per_transaction` bilden einen roten Cluster. Diese Features messen alle dasselbe Betragsniveau aus unterschiedlichen statistischen Blickwinkeln.
 
-**Implikation für Modeling:** Die hohe Multikollinearität der Bezirks- und Kredit-Features ist für baumbasierte Modelle unproblematisch, könnte aber bei logistischer Regression die Koeffizienten-Interpretation erschweren. Eine Reduktion auf je einen Vertreter pro Block (z.B. `district_avg_salary` für Bezirk, `has_loan` für Kredit) wäre für das Baseline-Modell sinnvoll.
+**Window-Block:** Die temporalen Sub-Fenster-Features (`balance_mean_q1`, `balance_mean_q4`, `turnover_h1`, `turnover_h2`, `n_tx_h1`, `n_tx_h2`, etc.) sind untereinander stark positiv korreliert. Konten mit hohem Umsatz in einem Halbjahr weisen typischerweise auch im anderen hohe Werte auf, was auf stabiles Transaktionsverhalten hinweist. Zusätzlich korrelieren `balance_last` und `turnover` mit den Window Features, da die Rollup-Gesamtwerte die Summe der Teilfenster widerspiegeln.
+
+**Negative Korrelationen:** `pct_type_credit` und `pct_type_withdrawal` sind nahezu perfekt negativ korreliert, da sie sich definitionsgemäss zu ~1 ergänzen. Dasselbe gilt für `freq_monthly` und `freq_weekly` als One-Hot-kodierte Kategorien.
+
+**Implikation für Modeling:** Die hohe Multikollinearität innerhalb der vier Blöcke ist für baumbasierte Modelle unproblematisch. Für die logistische Regression im Baseline-Modell empfiehlt sich je ein Vertreter pro Block, um Koeffizienteninstabilität zu vermeiden.
 
 ```{python}
 # === tsfresh Feature Selection: Statistische Relevanz ===
-from tsfresh import select_features
 
 # Nur tsfresh Features für die Selektion
 tsf_cols = [c for c in feature_matrix.columns if c.startswith(TSFRESH_FEATURE_PREFIX)]
@@ -709,7 +770,7 @@ for col in selected_cols[:20]:
 
 ### Interpretation: tsfresh Feature Selection
 
-Die statistische Relevanztestung via `select_features()` (Benjamini-Hochberg-Korrektur) reduziert die tsfresh-Features um **60.3%** (von 1'554 auf 617). Die eliminierten 937 Features sind entweder konstant (323 mit Null-Varianz), statistisch nicht mit dem Target assoziiert, oder redundant.
+Die statistische Relevanztestung via `select_features()` (Benjamini-Hochberg-Korrektur) reduziert die bereits deduplizierten tsfresh-Features um **55.3%** (von 1'066 auf 476). Die eliminierten 590 Features sind statistisch nicht signifikant mit dem Target assoziiert (korrigierter p-Wert über dem Schwellenwert). Hinweis: Diese Selektion ist eine **explorative** Relevanz-Analyse; die finale Feature-Matrix behält bewusst alle 1'066 tsfresh-Features, da die Tree-Modelle irrelevante Features selbst heruntergewichten.
 
 **Auffällig:** Die Top-20 selektierten Features stammen ausschliesslich aus der **`balance`-Zeitreihe**. Darunter dominieren:
 
@@ -717,14 +778,12 @@ Die statistische Relevanztestung via `select_features()` (Benjamini-Hochberg-Kor
 - **`c3` (Nichtlinearität)** mit verschiedenen Lags: Misst die nichtlineare Autokorrelation der Balance-Zeitreihe. Käufer- und Nicht-Käufer-Konten unterscheiden sich in der Dynamik ihres Kontostands.
 - **`abs_energy` / `root_mean_square`**: Mass für die Gesamtgrösse der Zeitreihenwerte — eng verwandt mit dem Saldo-Niveau.
 - **`benford_correlation`**: Prüft, ob die Ziffernverteilung der Balance-Werte dem Benfordschen Gesetz folgt — ein interessanter Hinweis auf unterschiedliche Transaktionsmuster.
-- **`fft_coefficient` (coeff_0)**: Der Gleichanteil der Fourier-Transformation, entspricht dem Mittelwert der Zeitreihe.
+- **`agg_linear_trend` (intercept)**: Achsenabschnitt linearer Trends über Zeitfenster-Segmente, mehrfach unter den Top-20 — beschreibt das Saldo-Niveau zu Beginn von Teilfenstern.
 
 **Implikation:** Der Kontostand (balance) ist informativer als der Transaktionsbetrag (amount) für die Vorhersage der Kreditkarten-Affinität. Das ist inhaltlich plausibel: Der Saldo reflektiert die finanzielle Stabilität und Kapazität eines Kunden besser als einzelne Transaktionsbeträge.
 
 ```{python}
 # === Feature Matrix speichern ===
-import os
-
 os.makedirs(str(PATH_PROCESSED), exist_ok=True)
 feature_matrix.to_parquet(str(PATH_PROCESSED / "feature_matrix.parquet"), index=False)
 
@@ -742,7 +801,7 @@ print(f"  Target=0: {(feature_matrix['target'] == 0).sum()}")
 
 | Kategorie | Anzahl | Beschreibung |
 |---|---|---|
-| tsfresh (auto) | ~100-200 (nach Dedup) | Automatisch extrahierte Zeitreihen-Features (Betrag + Saldo), dedupliziert via Korrelationsschwelle 0.95 |
+| tsfresh (auto) | 1'066 (nach Dedup) | Automatisch extrahierte Zeitreihen-Features (Betrag + Saldo), dedupliziert via Korrelationsschwelle 0.95 |
 | Baseline | 5 | Alter, Geschlecht, Region, Vermögen, Umsatz |
 | District | 6 | Bezirksdemografie (Gehalt, Arbeitslosigkeit, Urban, Einwohner, Unternehmer, Kriminalität) |
 | Loan | 3 | Kreditstatus und -details (temporal guard) |
@@ -755,7 +814,7 @@ print(f"  Target=0: {(feature_matrix['target'] == 0).sum()}")
 
 1. **Baseline-Modell:** Logistische Regression mit den 5 Baseline-Features
 2. **Handcrafted-Modell:** Logistische Regression mit ~65 handgefertigten Features (ohne tsfresh)
-3. **Kandidatenmodelle:** RandomForest, HistGBT mit allen ~250 Features
+3. **Kandidatenmodelle:** RandomForest, HistGBT und XGBoost mit allen ~1'130 Features
 4. **Hyperparameter-Tuning:** RandomizedSearch mit stratifizierter k-Fold CV
 5. **Evaluation:** ROC-AUC, Precision, Recall, Lift Curve
 

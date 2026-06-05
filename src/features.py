@@ -518,7 +518,7 @@ def select_tsfresh_by_correlation(
 
     Returns
     -------
-    List of selected column names (~100-200 features).
+    List of selected column names (~1066 features at corr_threshold=0.95).
     """
     # Align indices
     common_idx = tsfresh_df.index.intersection(y.index)
@@ -581,6 +581,35 @@ def select_tsfresh_by_correlation(
     return [str(cols[i]) for i in selected_idx]
 
 
+# ── Private Helpers ──────────────────────────────────────────────────────────
+
+
+def _compute_client_features(
+    study_table: pd.DataFrame,
+    client: pd.DataFrame,
+    disp: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute age_at_event and gender for each account via the OWNER disposition.
+
+    Returns DataFrame with columns: account_id, age_at_event, gender (1=M, 0=F).
+    Used internally by compute_baseline_features and compute_static_features
+    to avoid duplicating the OWNER-join logic.
+    """
+    owners = disp[disp["type"] == "OWNER"][["account_id", "client_id"]]
+    client_info = owners.merge(
+        client[["client_id", "gender", "birth_date"]], on="client_id", how="left"
+    )
+    client_info = client_info.merge(
+        study_table[["account_id", "event_date"]], on="account_id", how="left"
+    )
+    client_info["age_at_event"] = (
+        client_info["event_date"] - client_info["birth_date"]
+    ).dt.days / 365.25
+    client_info["gender"] = (client_info["gender"] == "M").astype(int)
+    return client_info[["account_id", "age_at_event", "gender"]]
+
+
 # ── Baseline Features (5 required) ──────────────────────────────────────────
 
 
@@ -617,18 +646,7 @@ def compute_baseline_features(
     tx_features = pd.concat([balance_last, turnover], axis=1).reset_index()
 
     # --- Client-based features (via OWNER disposition) ---
-    owners = disp[disp["type"] == "OWNER"][["account_id", "client_id"]]
-    client_info = owners.merge(
-        client[["client_id", "gender", "birth_date"]], on="client_id", how="left"
-    )
-    # Join with study_table for event_date
-    client_info = client_info.merge(
-        study_table[["account_id", "event_date"]], on="account_id", how="left"
-    )
-    client_info["age_at_event"] = (
-        client_info["event_date"] - client_info["birth_date"]
-    ).dt.days / 365.25
-    client_info["gender"] = (client_info["gender"] == "M").astype(int)
+    client_info = _compute_client_features(study_table, client, disp)
 
     # --- District-based features ---
     district_salary = account[["account_id", "district_id"]].merge(
@@ -677,19 +695,9 @@ def compute_static_features(
     result = study_table[["account_id"]].copy()
 
     # --- Client features (via OWNER) ---
-    owners = disp[disp["type"] == "OWNER"][["account_id", "client_id"]]
-    client_info = owners.merge(
-        client[["client_id", "gender", "birth_date"]], on="client_id", how="left"
-    )
-    client_info = client_info.merge(
-        study_table[["account_id", "event_date"]], on="account_id", how="left"
-    )
-    client_info["age_at_event"] = (
-        client_info["event_date"] - client_info["birth_date"]
-    ).dt.days / 365.25
-    client_info["gender"] = (client_info["gender"] == "M").astype(int)
+    client_info = _compute_client_features(study_table, client, disp)
     result = result.merge(
-        client_info[["account_id", "age_at_event", "gender"]],
+        client_info,
         on="account_id",
         how="left",
     )

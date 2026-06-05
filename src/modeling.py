@@ -93,12 +93,12 @@ def get_feature_sets(fm: pd.DataFrame) -> dict[str, list[str]]:
 
 
 def build_pipeline(
-    model, feature_cols: list[str], scale: bool = False
+    model, scale: bool = False
 ) -> Pipeline:
     """
     Build a leakage-free sklearn Pipeline.
 
-    Steps: ColumnSelector → SimpleImputer(median) → [StandardScaler] → Model
+    Steps: SimpleImputer(median) → [StandardScaler] → Model
     """
     steps = []
 

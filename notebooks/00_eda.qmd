@@ -1,7 +1,7 @@
 ---
 title: 'AML - Phase 1: EDA'
 author: Luca Manna
-date: '2026-03-14'
+date: 2026-06-5
 format:
   html:
     toc: true
@@ -13,8 +13,8 @@ jupyter: python3
 ---
 
 ```{python}
-import sys
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +25,13 @@ from sklearn.model_selection import train_test_split
 
 # Projektroot für src-Importe
 sys.path.insert(0, "..")
-from src.data import parse_date, extract_gender_and_birth, set_plot_style
+
+from src.data import (
+    assign_pseudo_event_dates,
+    extract_gender_and_birth,
+    parse_date,
+    set_plot_style,
+)
 ```
 
 ```{python}
@@ -228,15 +234,12 @@ Notation `(min,max)`:
 - `(1,N)` heisst mindestens ein Eintrag, ohne obere Schranke.
 - `(1,2)` ist eine harte Obergrenze von zwei (z.B. OWNER + optionaler DISPONENT pro Konto).
 
-> Der PK der Card-Tabelle ist `card.card_id` (siehe PK-Check oben). Die Spalte `card.disp_id` ist ein FK auf `disp.disp_id` mit einem **Unique-Constraint** (jede Disposition kann höchstens eine Karte haben). Daraus folgt die Beziehung disp -> card als **1:0..1** (optional 1:1).
 
 ## ERD
 
 Das ERD wurde basierend auf den vorherigen Analysen erstellt. 
 
-> TODO: In dem ERD muss in der card Tabelle noch der PK geändert werden von disp_id zu card_id
-
-![title](../erd/aml.png)
+![ERD Diagramm](../erd/aml.png)
 
 ## Tabellenübersicht: Datentypen, Speicher & deskriptive Statistiken
 Bevor wir in die Datenqualität einsteigen, verschaffen wir uns einen kompakten Überblick über alle Tabellen: Datentypen, Speicherverbrauch und die wichtigsten deskriptiven Kennzahlen der numerischen Spalten.
@@ -274,7 +277,20 @@ print("=== DESCRIBE: district (demografische Kennzahlen) ===")
 print(district.describe().round(1).to_string())
 ```
 
-### ErkenntnisseDie Transaktionstabelle (`trans`) dominiert mit 1.06 Mio. Zeilen und 100.5 MB den Datensatz bei weitem. Alle anderen Tabellen zusammen belegen weniger als 1 MB. Sie ist damit die primäre Datenquelle für das spätere Feature Engineering.Mehrere Datumsspalten (`account.date`, `loan.date`, `trans.date`) liegen noch im Format YYMMDD als Integer vor und werden im nächsten Schritt in `datetime` konvertiert. Das Feld `card.issued` ist als String gespeichert und enthält teils angehängte Stunden.Die `district`-Tabelle enthält kryptische Spaltennamen (A1 bis A16). Die für das Modell relevanten Felder sind Durchschnittsgehalt (A11: 8110 bis 12541 CZK), Arbeitslosenquote (A13: 0.4% bis 9.4%) und Urbanisierungsgrad (A10: 33.9% bis 100%). Die starke Streuung der Einwohnerzahl (A4: 42821 bis 1204953) zeigt den Grössenunterschied zwischen Prag und ländlichen Bezirken.Zwei Auffälligkeiten aus `trans.describe()`:* Kontostände können negativ werden (Minimum: 41125 CZK im Minus), d.h. Überziehungskredite sind im Datensatz vorhanden.* Transaktionsbeträge sind stark rechtsschief (Median 2100 CZK gegenüber Mittelwert 5924 CZK), was auf vereinzelte sehr grosse Transaktionen hindeutet.Kreditlaufzeiten in `loan` bewegen sich zwischen 12 und 60 Monaten, Kreditbeträge zwischen 4980 und 590820 CZK.
+### Erkenntnisse
+
+Die Transaktionstabelle (`trans`) dominiert mit 1.06 Mio. Zeilen und 100.5 MB den Datensatz bei weitem. Alle anderen Tabellen zusammen belegen weniger als 1 MB. Sie ist damit die primäre Datenquelle für das spätere Feature Engineering.
+
+Mehrere Datumsspalten (`account.date`, `loan.date`, `trans.date`) liegen noch im Format YYMMDD als Integer vor und werden im nächsten Schritt in `datetime` konvertiert. Das Feld `card.issued` ist als String gespeichert und enthält teils angehängte Stunden.
+
+Die `district`-Tabelle enthält kryptische Spaltennamen (A1 bis A16). Die für das Modell relevanten Felder sind Durchschnittsgehalt (A11: 8110 bis 12541 CZK), Arbeitslosenquote (A13: 0.4% bis 9.4%) und Urbanisierungsgrad (A10: 33.9% bis 100%). Die starke Streuung der Einwohnerzahl (A4: 42821 bis 1204953) zeigt den Grössenunterschied zwischen Prag und ländlichen Bezirken.
+
+Zwei Auffälligkeiten aus `trans.describe()`:
+
+* Kontostände können negativ werden (Minimum: 41125 CZK im Minus), d.h. Überziehungskredite sind im Datensatz vorhanden.
+* Transaktionsbeträge sind stark rechtsschief (Median 2100 CZK gegenüber Mittelwert 5924 CZK), was auf vereinzelte sehr grosse Transaktionen hindeutet.
+
+Kreditlaufzeiten in `loan` bewegen sich zwischen 12 und 60 Monaten, Kreditbeträge zwischen 4980 und 590820 CZK.
 
 # Datenqualität und vorbereitende Exploration
 
@@ -296,7 +312,11 @@ for name, df in dataframes.items():
     print("-" * 40)
 ```
 
-### Erkenntnisse7 von 8 Tabellen weisen weder Duplikate noch fehlende Werte auf. Die Datenqualität ist damit insgesamt hoch.Einzige Ausnahme ist `trans` mit vier betroffenen Spalten: `operation` (183114 NaN, ca. 17%), `k_symbol` (481881 NaN, ca. 46%), `bank` (782812 NaN, ca. 74%) und `account` (760931 NaN, ca. 72%). Die hohen Anteile deuten auf strukturell bedingte Lücken hin und nicht auf zufällige Datenfehler. Die detaillierte Analyse folgt im nächsten Abschnitt.
+### Erkenntnisse
+
+7 von 8 Tabellen weisen weder Duplikate noch fehlende Werte auf. Die Datenqualität ist damit insgesamt hoch.
+
+Einzige Ausnahme ist `trans` mit vier betroffenen Spalten: `operation` (183114 NaN, ca. 17%), `k_symbol` (481881 NaN, ca. 46%), `bank` (782812 NaN, ca. 74%) und `account` (760931 NaN, ca. 72%). Die hohen Anteile deuten auf strukturell bedingte Lücken hin und nicht auf zufällige Datenfehler. Die detaillierte Analyse folgt im nächsten Abschnitt.
 
 ### Analyse fehlender Werte in `trans`
 Die Tabelle `trans` ist die einzige mit fehlenden Werten. Vier Spalten sind betroffen: `operation` (17%), `k_symbol` (46%), `bank` (74%) und `account` (72%). Bevor wir diese Werte im Feature Engineering behandeln, müssen wir verstehen, ob es sich um **strukturelle** (systembedingte) oder **zufällige** Lücken handelt. Dazu analysieren wir die Verteilung der NaNs in Abhängigkeit vom Transaktionstyp (`type`) und der Transaktionsart (`operation`).
@@ -500,7 +520,11 @@ print(
 )
 ```
 
-### Erkenntnisse92.6% der Konten (4167 von 4500) verwenden den monatlichen Kontoauszug. Wöchentliche (240) und transaktionsbasierte (93) Auszüge sind selten. Die Kontoauszugs-Frequenz ist ein explizit gefordertes Baseline-Feature und fliesst als Indikatorvariable ins Modell ein.Die monatlichen Kontoeröffnungen zeigen ein klares Wachstumsmuster: von 1993 bis Mitte 1996 nimmt die Neukunden-Akquisition deutlich zu und erreicht ein Maximum von rund 135 neuen Konten pro Monat. Ab Ende 1996 flacht das Wachstum ab. Das letzte Konto wurde am 1997-12-29 eröffnet, d.h. 1998 gibt es keine neuen Konten im Datensatz. Dieser Wachstumsverlauf ist später relevant für die Interpretation der Kalenderzeit-Verteilung der Karten-Events.
+### Erkenntnisse
+
+92.6% der Konten (4167 von 4500) verwenden den monatlichen Kontoauszug. Wöchentliche (240) und transaktionsbasierte (93) Auszüge sind selten. Die Kontoauszugs-Frequenz ist ein explizit gefordertes Baseline-Feature und fliesst als Indikatorvariable ins Modell ein.
+
+Die monatlichen Kontoeröffnungen zeigen ein klares Wachstumsmuster: von 1993 bis Mitte 1996 nimmt die Neukunden-Akquisition deutlich zu und erreicht ein Maximum von rund 135 neuen Konten pro Monat. Ab Ende 1996 flacht das Wachstum ab. Das letzte Konto wurde am 1997-12-29 eröffnet, d.h. 1998 gibt es keine neuen Konten im Datensatz. Dieser Wachstumsverlauf ist später relevant für die Interpretation der Kalenderzeit-Verteilung der Karten-Events.
 
 ## Exploration der Kundendaten (client)
 
@@ -544,7 +568,13 @@ print(client["age"].describe().round(1))
 print(f"\nGeschlechterverteilung:\n{gender_counts}")
 ```
 
-### ErkenntnisseDas Alter ist relativ zum Ende der Transaktionshistorie (Ende 1998) berechnet. Die Verteilung erstreckt sich von 11 bis 87 Jahre (Median 44, Mittelwert 44.8). Das Minimum von 11 Jahren zeigt, dass Minderjährige im Datensatz vorhanden sind. Diese Gruppe ist für das Kreditkartenmodell nicht relevant und wird im Studiendesign über den Alters-Cutoff von 21 Jahren ausgeschlossen.Die Altersverteilung ist im Bereich 20 bis 60 Jahre annähernd gleichmässig, mit einem leichten Häufigkeitsabfall nach dem 60. Lebensjahr.Die Geschlechterverteilung ist nahezu ausgeglichen (M: 2724, F: 2645). Ein systematischer Gender-Bias in der Kundenbasis ist nicht vorhanden. Beide Merkmale sind explizit geforderte Baseline-Features für das Modell.
+### Erkenntnisse
+
+Das Alter ist relativ zum Ende der Transaktionshistorie (Ende 1998) berechnet. Die Verteilung erstreckt sich von 11 bis 87 Jahre (Median 44, Mittelwert 44.8). Das Minimum von 11 Jahren zeigt, dass Minderjährige im Datensatz vorhanden sind. Diese Gruppe ist für das Kreditkartenmodell nicht relevant und wird im Studiendesign über den Alters-Cutoff von 21 Jahren ausgeschlossen.
+
+Die Altersverteilung ist im Bereich 20 bis 60 Jahre annähernd gleichmässig, mit einem leichten Häufigkeitsabfall nach dem 60. Lebensjahr.
+
+Die Geschlechterverteilung ist nahezu ausgeglichen (M: 2724, F: 2645). Ein systematischer Gender-Bias in der Kundenbasis ist nicht vorhanden. Beide Merkmale sind explizit geforderte Baseline-Features für das Modell.
 
 ## Exploration der Dispositionsdaten (disp)
 
@@ -639,7 +669,6 @@ sns.heatmap(
     ax=axes[1, 1],
     vmin=-1,
     vmax=1,
-    cmap="viridis",  # Explizit das Theme 'viridis' setzen
 )
 axes[1, 1].set_title("Korrelation der Bezirks-Kennzahlen")
 
@@ -654,7 +683,13 @@ print("Top-10 Bezirke nach Anzahl Konten:")
 print(accounts_per_district.head(10).to_string())
 ```
 
-### ErkenntnissePrag (district_id 1) dominiert die Kontoverteilung mit 554 Konten und ist damit mehr als dreimal so gross wie der zweitgrösste Bezirk (district_id 70 mit 152). Prag ist auch der Ausreisser im Durchschnittsgehalt (~12500 CZK gegenüber dem Median von 8814 CZK aller Bezirke).Das Durchschnittsgehalt (A11) ist rechtsschief verteilt. Die grosse Mehrheit der Bezirke liegt zwischen 8000 und 9500 CZK. Die Arbeitslosenquote (A13) ist ebenfalls rechtsschief mit einem Median von ca. 3.6%.Aus der Korrelationsmatrix sind zwei Zusammenhänge relevant für das Feature Engineering: Urbanisierungsgrad und Durchschnittsgehalt korrelieren moderat positiv (0.60), d.h. städtischere Bezirke haben tendenziell höhere Löhne. Unternehmerdichte und Arbeitslosenquote korrelieren negativ (0.51), was ökonomisch plausibel ist. Diese Kollinearität ist beim Einsatz beider Features im Modell zu beachten.
+### Erkenntnisse
+
+Prag (district_id 1) dominiert die Kontoverteilung mit 554 Konten und ist damit mehr als dreimal so gross wie der zweitgrösste Bezirk (district_id 70 mit 152). Prag ist auch der Ausreisser im Durchschnittsgehalt (~12500 CZK gegenüber dem Median von 8814 CZK aller Bezirke).
+
+Das Durchschnittsgehalt (A11) ist rechtsschief verteilt. Die grosse Mehrheit der Bezirke liegt zwischen 8000 und 9500 CZK. Die Arbeitslosenquote (A13) ist ebenfalls rechtsschief mit einem Median von ca. 3.6%.
+
+Aus der Korrelationsmatrix sind zwei Zusammenhänge relevant für das Feature Engineering: Urbanisierungsgrad und Durchschnittsgehalt korrelieren moderat positiv (0.60), d.h. städtischere Bezirke haben tendenziell höhere Löhne. Unternehmerdichte und Arbeitslosenquote korrelieren negativ (0.51), was ökonomisch plausibel ist. Diese Kollinearität ist beim Einsatz beider Features im Modell zu beachten.
 
 ## Exploration der Transaktionsdaten (trans)
 
@@ -714,7 +749,15 @@ print("Verteilung der Operationsmodi:")
 print(trans["operation"].value_counts(dropna=False).to_string())
 ```
 
-### ErkenntnisseDas monatliche Transaktionsvolumen wächst von 1993 bis Ende 1998 kontinuierlich, was das Kontowachstum der Bank widerspiegelt. Auffällig sind wiederkehrende Spikes jeweils zu Jahresbeginn (Januar 1994, 1995, 1996, 1997, 1998), wobei der Spike Anfang 1998 mit rund 43000 Transaktionen besonders ausgeprägt ist. Das Muster ist systematisch: Jahresbeginn-Spikes entstehen durch gebündelte Zinsgutschriften, die Banken typischerweise einmal jährlich zu Jahresbeginn als Systemtransaktionen buchen. Dies deckt sich mit dem k_symbol-Plot, in dem `interest_credited` die häufigste Kategorie ist, sowie mit dem Befund, dass diese Buchungen NaN als Operationsfeld aufweisen.Wie erwartet überwiegen Auszahlungen (withdrawal: 634571, 60%) gegenüber Gutschriften (credit: 405083, 38%). Konten werden primär zum Ausgeben genutzt.Bei den Operationsmodi dominiert `withdrawal_in_cash` mit 435000 Einträgen (41%). Die 183114 NaN-Einträge entsprechen Systemtransaktionen ohne explizite Kundenoperation (z.B. Zinsgutschriften) und wurden bereits als strukturelle NaNs identifiziert. `credit_card_withdrawal` ist mit 8036 Einträgen (0.8%) sehr selten und signalisiert bereits existierende Kreditkartennutzung in der Kundenbasis.Die Betragsverteilung ist auf der log-Skala bimodal: ein schmaler Spike bei sehr kleinen Beträgen (ca. 10 bis 20 CZK, vermutlich Zinsbuchungen) und die Hauptmasse zwischen 100 und 100000 CZK. Grosse Einzelbeträge bis 87400 CZK kommen vor, sind aber selten.
+### Erkenntnisse
+
+Das monatliche Transaktionsvolumen wächst von 1993 bis Ende 1998 kontinuierlich, was das Kontowachstum der Bank widerspiegelt. Auffällig sind wiederkehrende Spikes jeweils zu Jahresbeginn (Januar 1994, 1995, 1996, 1997, 1998), wobei der Spike Anfang 1998 mit rund 43000 Transaktionen besonders ausgeprägt ist. Das Muster ist systematisch: Jahresbeginn-Spikes entstehen durch gebündelte Zinsgutschriften, die Banken typischerweise einmal jährlich zu Jahresbeginn als Systemtransaktionen buchen. Dies deckt sich mit dem k_symbol-Plot, in dem `interest_credited` die häufigste Kategorie ist, sowie mit dem Befund, dass diese Buchungen NaN als Operationsfeld aufweisen.
+
+Wie erwartet überwiegen Auszahlungen (withdrawal: 634571, 60%) gegenüber Gutschriften (credit: 405083, 38%). Konten werden primär zum Ausgeben genutzt.
+
+Bei den Operationsmodi dominiert `withdrawal_in_cash` mit 435000 Einträgen (41%). Die 183114 NaN-Einträge entsprechen Systemtransaktionen ohne explizite Kundenoperation (z.B. Zinsgutschriften) und wurden bereits als strukturelle NaNs identifiziert. `credit_card_withdrawal` ist mit 8036 Einträgen (0.8%) sehr selten und signalisiert bereits existierende Kreditkartennutzung in der Kundenbasis.
+
+Die Betragsverteilung ist auf der log-Skala bimodal: ein schmaler Spike bei sehr kleinen Beträgen (ca. 10 bis 20 CZK, vermutlich Zinsbuchungen) und die Hauptmasse zwischen 100 und 100000 CZK. Grosse Einzelbeträge bis 87400 CZK kommen vor, sind aber selten.
 
 ## Exploration der Kreditdaten (loan)
 
@@ -768,7 +811,15 @@ print(f"Anzahl Kredite total: {len(loan)}")
 print(f"\nStatusverteilung:\n{status_counts}")
 ```
 
-### ErkenntnisseNur 682 von 4500 Konten (15.2%) haben überhaupt einen Kredit. Kreditvergaben beginnen erst ab 1994 und nehmen bis 1998 zu, was wiederum das allgemeine Kundenwachstum widerspiegelt.Die Laufzeiten sind auf fünf diskrete Werte standardisiert (12, 24, 36, 48, 60 Monate) und gleichmässig verteilt. Die 60-Monats-Laufzeit ist mit 144 Krediten leicht am häufigsten.Der Grossteil der Kredite ist in Ordnung: Status C (laufend OK) macht 59% aus, Status A (abgeschlossen OK) weitere 30%. Die kombinierte Ausfallrate aus Status B (abgeschlossen, unbezahlt) und D (laufend, in Schulden) liegt bei rund 11%.Aus dem Boxplot ist erkennbar, dass laufende Kredite mit Problemen (Status D) im Median deutlich höhere Beträge aufweisen als abgeschlossene Kredite. Ob ein Konto einen Kredit hat sowie die Kredithöhe und monatliche Rate sind Features für das Affinitätsmodell.
+### Erkenntnisse
+
+Nur 682 von 4500 Konten (15.2%) haben überhaupt einen Kredit. Kreditvergaben beginnen erst ab 1994 und nehmen bis 1998 zu, was wiederum das allgemeine Kundenwachstum widerspiegelt.
+
+Die Laufzeiten sind auf fünf diskrete Werte standardisiert (12, 24, 36, 48, 60 Monate) und gleichmässig verteilt. Die 60-Monats-Laufzeit ist mit 144 Krediten leicht am häufigsten.
+
+Der Grossteil der Kredite ist in Ordnung: Status C (laufend OK) macht 59% aus, Status A (abgeschlossen OK) weitere 30%. Die kombinierte Ausfallrate aus Status B (abgeschlossen, unbezahlt) und D (laufend, in Schulden) liegt bei rund 11%.
+
+Aus dem Boxplot ist erkennbar, dass laufende Kredite mit Problemen (Status D) im Median deutlich höhere Beträge aufweisen als abgeschlossene Kredite. Ob ein Konto einen Kredit hat sowie die Kredithöhe und monatliche Rate sind Features für das Affinitätsmodell.
 
 ## Exploration der Dauerauftragsdaten (order)
 
@@ -811,7 +862,13 @@ print("Deskriptive Statistik der Dauerauftragsbeträge:")
 print(order["amount"].describe().round(1))
 ```
 
-### Erkenntnisse`household_payment` dominiert mit 3502 Einträgen (54%) klar. Die zweithäufigste Kategorie (1379 Einträge) ist im Plot nicht beschriftet, entspricht aber `payment_for_statement`. Insgesamt decken die fünf Kategorien household_payment, payment_for_statement, loan_payment (717), insurance_payment (532) und leasing (341) alle 6471 Daueraufträge ab.Die Betragsverteilung variiert je nach Zweck: Kreditraten-Daueraufträge haben den höchsten Median (~4000 CZK), während Versicherungszahlungen tiefer liegen (~1500 CZK). Alle Kategorien weisen Ausreisser nach oben auf. Der Gesamtbereich ist 1 bis 14882 CZK bei einem Median von 2596 CZK.Für das Modell relevant sind das Vorhandensein bestimmter Dauerauftragstypen als binäre Features (`has_household_order`, `has_loan_order`, `has_insurance_order`) sowie die Anzahl und Gesamtsumme aller Daueraufträge als Indikatoren für finanzielle Verpflichtungen.
+### Erkenntnisse
+
+`household_payment` dominiert mit 3502 Einträgen (54%) klar. Die zweithäufigste Kategorie (1379 Einträge) ist im Plot nicht beschriftet, entspricht aber `payment_for_statement`. Insgesamt decken die fünf Kategorien household_payment, payment_for_statement, loan_payment (717), insurance_payment (532) und leasing (341) alle 6471 Daueraufträge ab.
+
+Die Betragsverteilung variiert je nach Zweck: Kreditraten-Daueraufträge haben den höchsten Median (~4000 CZK), während Versicherungszahlungen tiefer liegen (~1500 CZK). Alle Kategorien weisen Ausreisser nach oben auf. Der Gesamtbereich ist 1 bis 14882 CZK bei einem Median von 2596 CZK.
+
+Für das Modell relevant sind das Vorhandensein bestimmter Dauerauftragstypen als binäre Features (`has_household_order`, `has_loan_order`, `has_insurance_order`) sowie die Anzahl und Gesamtsumme aller Daueraufträge als Indikatoren für finanzielle Verpflichtungen.
 
 ## Zielgruppen-Definition: Kreditkarten-Käufer (Target = 1)
 
@@ -876,7 +933,13 @@ plt.tight_layout()
 plt.show()
 ```
 
-### ErkenntnisseVon 892 Karten total sind 145 Junior-Karten (16.2%), die gemäss Aufgabenstellung aus der Zielgruppe ausgeschlossen werden. Die verbleibenden 747 Karten (classic: 659, gold: 88) bilden die Positivklasse (Target = 1).Die Kartenausstellungen konzentrieren sich stark auf die Jahre 1997 bis 1999. Vor 1996 wurden kaum Karten vergeben. Diese zeitliche Konzentration erklärt, warum die Käufer-Gruppe im Studiendesign eine spezifische Kalenderzeit-Verteilung aufweist und ist der Hauptgrund dafür, dass das Tenure-Matching gegenüber einem reinen Kalenderzeit-Ansatz bevorzugt wird.Gold-Karten sind selten (88, entspricht 11.8% der gültigen Karten) und treten erst ab 1996/97 regelmässig auf. Classic-Karten wachsen ab 1997 stark und erreichen Ende 1998 einen Peak von rund 40 Ausstellungen pro Monat.
+### Erkenntnisse
+
+Von 892 Karten total sind 145 Junior-Karten (16.2%), die gemäss Aufgabenstellung aus der Zielgruppe ausgeschlossen werden. Die verbleibenden 747 Karten (classic: 659, gold: 88) bilden die Positivklasse (Target = 1).
+
+Die Kartenausstellungen konzentrieren sich stark auf die Jahre 1997 bis 1999. Vor 1996 wurden kaum Karten vergeben. Diese zeitliche Konzentration erklärt, warum die Käufer-Gruppe im Studiendesign eine spezifische Kalenderzeit-Verteilung aufweist und ist der Hauptgrund dafür, dass das Tenure-Matching gegenüber einem reinen Kalenderzeit-Ansatz bevorzugt wird.
+
+Gold-Karten sind selten (88, entspricht 11.8% der gültigen Karten) und treten erst ab 1996/97 regelmässig auf. Classic-Karten wachsen ab 1997 stark und erreichen Ende 1998 einen Peak von rund 40 Ausstellungen pro Monat.
 
 ## Exemplarische Kontoanalyse: Vermögen & Umsatz (Konten 14 und 18)
 
@@ -950,7 +1013,11 @@ plt.tight_layout()
 plt.show()
 ```
 
-### ErkenntnisseDie beiden Konten zeigen grundlegend unterschiedliche Verhaltensmuster. Konto 18 ist hochvolatil mit unregelmässigen Umsatzspikes von bis zu 300000 CZK pro Monat und entsprechend starken Schwankungen im Saldo (Bereich ca. 1000 bis 107000 CZK). Konto 14 erscheint erst ab 1997 (spätere Kontoeröffnung), hat einen moderaten und gleichmässigeren Umsatz unter 50000 CZK pro Monat und einen stabilen Saldo im Bereich 25000 bis 45000 CZK.Diese Beispiele verdeutlichen die Notwendigkeit von Rollup-Features: Der letzte Kontostand (`balance_last`) und der Gesamtumsatz (`turnover`) über ein 12-Monats-Fenster aggregieren diese volatilen Zeitreihen zu einer einzelnen Zahl pro Konto. Statistische Kennzahlen wie Standardabweichung, Median und Trend ergänzen dabei das Bild und sind robuster gegenüber einzelnen Ausreissern.
+### Erkenntnisse
+
+Die beiden Konten zeigen grundlegend unterschiedliche Verhaltensmuster. Konto 18 ist hochvolatil mit unregelmässigen Umsatzspikes von bis zu 300000 CZK pro Monat und entsprechend starken Schwankungen im Saldo (Bereich ca. 1000 bis 107000 CZK). Konto 14 erscheint erst ab 1997 (spätere Kontoeröffnung), hat einen moderaten und gleichmässigeren Umsatz unter 50000 CZK pro Monat und einen stabilen Saldo im Bereich 25000 bis 45000 CZK.
+
+Diese Beispiele verdeutlichen die Notwendigkeit von Rollup-Features: Der letzte Kontostand (`balance_last`) und der Gesamtumsatz (`turnover`) über ein 12-Monats-Fenster aggregieren diese volatilen Zeitreihen zu einer einzelnen Zahl pro Konto. Statistische Kennzahlen wie Standardabweichung, Median und Trend ergänzen dabei das Bild und sind robuster gegenüber einzelnen Ausreissern.
 
 ## Zeitliche Analyse: Kontoeröffnung bis Kartenkauf
 
@@ -997,7 +1064,13 @@ print("Zusammenfassende Statistiken (Monate bis zum Kartenkauf):")
 print(card_account_map["months_to_card"].describe().round(1))
 ```
 
-### ErkenntnisseDie Verteilung ist rechtsschief: Die Mehrheit der Kartenausstellungen erfolgt innerhalb der ersten 2 Jahre nach Kontoeröffnung, mit einem Median von 22 Monaten und einem Modus um 20 Monate. Ein langer rechter Schwanz erstreckt sich bis 71 Monate.Das Minimum von 6 Monaten zeigt, dass einzelne Karten sehr früh ausgestellt wurden. Der 25%-Quantil liegt bei 13 Monaten, was dem Mindest-Rollup-Constraint (12M Rollup + 1M Lag = 13M) entspricht. Karten, die innerhalb der ersten 13 Monate ausgestellt wurden, können kein vollständiges Rollup-Fenster vorweisen und werden im Studiendesign ausgeschlossen.Diese Verteilung bildet die empirische Grundlage für die Pseudo-Event-Zuweisung an Nicht-Kartenbesitzer. Sie wird ausschliesslich aus Train-Card-Holders berechnet, um Data Leakage zu verhindern.
+### Erkenntnisse
+
+Die Verteilung ist rechtsschief: Die Mehrheit der Kartenausstellungen erfolgt innerhalb der ersten 2 Jahre nach Kontoeröffnung, mit einem Median von 22 Monaten und einem Modus um 20 Monate. Ein langer rechter Schwanz erstreckt sich bis 71 Monate.
+
+Das Minimum von 6 Monaten zeigt, dass einzelne Karten sehr früh ausgestellt wurden. Der 25%-Quantil liegt bei 13 Monaten, was dem Mindest-Rollup-Constraint (12M Rollup + 1M Lag = 13M) entspricht. Karten, die innerhalb der ersten 13 Monate ausgestellt wurden, können kein vollständiges Rollup-Fenster vorweisen und werden im Studiendesign ausgeschlossen.
+
+Diese Verteilung bildet die empirische Grundlage für die Pseudo-Event-Zuweisung an Nicht-Kartenbesitzer. Sie wird ausschliesslich aus Train-Card-Holders berechnet, um Data Leakage zu verhindern.
 
 ## Erster Vergleich: Kartenbesitzer vs. Nicht-Kartenbesitzer
 
@@ -1152,7 +1225,19 @@ comparison.index = ["Kein Card (0)", "Card Holder (1)"]
 print(comparison.to_string())
 ```
 
-### ErkenntnisseDie Zielvariable ist moderat unbalanciert: 13.9% Kartenbesitzer (747) gegenüber 86.1% Nicht-Kartenbesitzer (4622). Dieser Vergleich erfolgt noch vor dem Rollup-Filter und ohne Studiendesign-Bereinigung.Die Unterschiede zwischen den Gruppen auf den Baseline-Features sind insgesamt gering:* **Alter:** Kartenbesitzer sind im Schnitt etwas jünger (Mittelwert 43.0 vs. 45.1 Jahre). Der Unterschied ist statistisch vorhanden, aber klein.* **Geschlecht:** Kartenbesitzer sind leicht häufiger männlich (53% vs. 50%). Kein starkes Signal.* **Durchschnittsgehalt:** Marginaler Unterschied (9605 vs. 9496 CZK). Beide Gruppen ähnlich verteilt.* **Kredit vorhanden:** Der deutlichste Unterschied: 20% der Kartenbesitzer haben einen Kredit gegenüber 15% der Nicht-Kartenbesitzer. Kartenbesitzer nutzen tendenziell mehr Finanzprodukte.* **Kontoauszugs-Frequenz:** Nahezu identisch in beiden Gruppen, kein Signal.Die schwache Trennung auf den Basis-Features zeigt, dass diese allein nicht ausreichen für ein starkes Modell. Transaktionsbasierte Behavioral-Features aus dem Rollup-Fenster werden für die eigentliche Trennleistung entscheidend sein.
+### Erkenntnisse
+
+Die Zielvariable ist moderat unbalanciert: 13.9% Kartenbesitzer (747) gegenüber 86.1% Nicht-Kartenbesitzer (4622). Dieser Vergleich erfolgt noch vor dem Rollup-Filter und ohne Studiendesign-Bereinigung.
+
+Die Unterschiede zwischen den Gruppen auf den Baseline-Features sind insgesamt gering:
+
+* **Alter:** Kartenbesitzer sind im Schnitt etwas jünger (Mittelwert 43.0 vs. 45.1 Jahre). Der Unterschied ist statistisch vorhanden, aber klein.
+* **Geschlecht:** Kartenbesitzer sind leicht häufiger männlich (53% vs. 50%). Kein starkes Signal.
+* **Durchschnittsgehalt:** Marginaler Unterschied (9605 vs. 9496 CZK). Beide Gruppen ähnlich verteilt.
+* **Kredit vorhanden:** Der deutlichste Unterschied: 20% der Kartenbesitzer haben einen Kredit gegenüber 15% der Nicht-Kartenbesitzer. Kartenbesitzer nutzen tendenziell mehr Finanzprodukte.
+* **Kontoauszugs-Frequenz:** Nahezu identisch in beiden Gruppen, kein Signal.
+
+Die schwache Trennung auf den Basis-Features zeigt, dass diese allein nicht ausreichen für ein starkes Modell. Transaktionsbasierte Behavioral-Features aus dem Rollup-Fenster werden für die eigentliche Trennleistung entscheidend sein.
 
 ```{python}
 # === Studiendesign: Konstanten ===
@@ -1443,95 +1528,7 @@ print(f"\n  Empirische Verteilung aus {len(empirical_months)} Train-Card-Holders
 
 ```{python}
 # === Pseudo-Ereignisdaten für Nicht-Kartenbesitzer (Train-only Distribution) ===
-
-
-def assign_pseudo_event_dates(
-    account_df: pd.DataFrame,
-    eligible_non_card_ids: set[int],
-    empirical_months: pd.Series,
-    max_data_date: pd.Timestamp,
-    first_trans: pd.Series,
-    rollup_months: int = ROLLUP_MONTHS,
-    lag_months: int = LAG_MONTHS,
-    random_state: int = RANDOM_STATE,
-) -> pd.DataFrame:
-    """
-    Weist jedem eligible Nicht-Karten-Konto ein Pseudo-Ereignisdatum zu,
-    basierend auf der empirischen Verteilung aus dem Trainingsset.
-
-    Accounts ohne feasible Bereich werden ausgeschlossen (unzureichende Historie).
-    Rollup-Fenster: [event - (rollup_months + lag_months) ... event - lag_months]
-    """
-    rng = np.random.default_rng(random_state)
-    total_history = rollup_months + lag_months
-
-    # Nur eligible Nicht-Karten-Konten
-    non_card = account_df[account_df["account_id"].isin(eligible_non_card_ids)].copy()
-    non_card = non_card.rename(columns={"date": "account_creation_date"})
-    non_card = non_card.merge(first_trans, on="account_id", how="left")
-
-    empirical_values = empirical_months.values
-    max_period = max_data_date.to_period("M")
-
-    # Vectorize: Berechne min/max months pro Konto via Period-Arithmetik
-    creation_periods = non_card["account_creation_date"].dt.to_period("M")
-    first_tx_periods = non_card["first_trans_date"].dt.to_period("M")
-
-    # min_months: event >= first_tx + total_history Monate
-    non_card["min_months"] = (
-        (first_tx_periods + total_history).astype("int64")
-        - creation_periods.astype("int64")
-    ).clip(lower=total_history)
-
-    # max_months: event <= max_data_date
-    non_card["max_months"] = max_period.ordinal - creation_periods.astype("int64")
-
-    # Ausschluss: Konten ohne machbaren Bereich (zu spät eröffnet)
-    infeasible_mask = non_card["max_months"] < non_card["min_months"]
-    n_infeasible = infeasible_mask.sum()
-    if n_infeasible > 0:
-        print(f"  Ausgeschlossen (unzureichende Historie): {n_infeasible} Konten")
-    non_card = non_card[~infeasible_mask].copy()
-
-    # Per-row sampling (unvermeidbar wegen row-spezifischer feasible ranges)
-    def _sample_row(row):
-        feasible = empirical_values[
-            (empirical_values >= row["min_months"])
-            & (empirical_values <= row["max_months"])
-        ]
-        if len(feasible) > 0:
-            return int(rng.choice(feasible))
-        # Fallback: Mitte des machbaren Bereichs (sollte nie eintreten)
-        return int((row["min_months"] + row["max_months"]) // 2)
-
-    non_card["months_to_event"] = non_card.apply(_sample_row, axis=1)
-
-    # Event-Datum und Rollup-Fenster berechnen
-    non_card["event_date"] = non_card.apply(
-        lambda r: r["account_creation_date"]
-        + pd.DateOffset(months=int(r["months_to_event"])),
-        axis=1,
-    )
-    non_card["rollup_end"] = non_card["event_date"].apply(
-        lambda d: (d.to_period("M") - lag_months).to_timestamp()
-    )
-    non_card["rollup_start"] = non_card["event_date"].apply(
-        lambda d: (d.to_period("M") - total_history).to_timestamp()
-    )
-    non_card["target"] = 0
-
-    return non_card[
-        [
-            "account_id",
-            "account_creation_date",
-            "event_date",
-            "rollup_start",
-            "rollup_end",
-            "months_to_event",
-            "target",
-        ]
-    ]
-
+# assign_pseudo_event_dates ist in src/data.py definiert (DRY-Prinzip).
 
 # Eligible Non-Card Account IDs
 eligible_non_card_ids = eligible_account_ids - card_account_ids
